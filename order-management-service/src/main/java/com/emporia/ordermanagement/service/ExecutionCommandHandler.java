@@ -1,0 +1,293 @@
+package com.emporia.ordermanagement.service;
+
+import com.emporia.events.TradingEvents.ExecutionCommand;
+import com.emporia.events.TradingEvents.OrderDomainEvent;
+import com.emporia.events.TradingEvents.OrderStatus;
+import com.emporia.events.TradingEvents.OrderView;
+import com.emporia.ordermanagement.disruptor.HotPathAssertions;
+import com.emporia.ordermanagement.model.Execution;
+import com.emporia.ordermanagement.model.OrderEvent;
+import com.emporia.ordermanagement.model.TradingOrder;
+import com.emporia.ordermanagement.repository.ExecutionRepository;
+import com.emporia.ordermanagement.repository.TradingOrderRepository;
+import org.springframework.stereotype.Service;
+import tools.jackson.databind.ObjectMapper;
+
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.function.Supplier;
+
+import static com.emporia.events.TradingEvents.SCHEMA_VERSION;
+
+@Service
+public class ExecutionCommandHandler {
+    private static final List<OrderStatus> ACTIVE =
+            List.of(OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED);
+
+    private final TradingOrderRepository orders;
+    private final ExecutionRepository executions;
+    private final OrderMetrics metrics;
+    private final OrderStateCache cache;
+    private final AsyncDbWriter asyncDbWriter;
+    private final com.emporia.execution.ShardedOrderDispatcher shardedOrderDispatcher;
+
+    ExecutionCommandHandler(TradingOrderRepository orders, ExecutionRepository executions,
+                            ObjectMapper objectMapper, OrderMetrics metrics,
+                            OrderStateCache cache, AsyncDbWriter asyncDbWriter) {
+        this(orders, executions, objectMapper, metrics, cache, asyncDbWriter, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    ExecutionCommandHandler(TradingOrderRepository orders, ExecutionRepository executions,
+                            ObjectMapper objectMapper, OrderMetrics metrics,
+                            OrderStateCache cache, AsyncDbWriter asyncDbWriter,
+                            com.emporia.execution.ShardedOrderDispatcher shardedOrderDispatcher) {
+        this.orders = orders;
+        this.executions = executions;
+        this.metrics = metrics;
+        this.cache = cache;
+        this.asyncDbWriter = asyncDbWriter;
+        this.shardedOrderDispatcher = shardedOrderDispatcher;
+    }
+
+    /**
+     * Applies a venue update and every resulting parent transition.
+     * Direct Java invocation without Spring AOP / CGLIB proxy reflection.
+     */
+    public List<OrderDomainEvent> handle(ExecutionCommand command) {
+        // LMAX_ARCHITECTURE_REWORK_PLAN.md task 5.5's runtime guard for R1
+        // (Single Writer ownership). Off by default (HotPathAssertions.ENABLED) -
+        // a diagnostic, not a production gate. No documented exception exists
+        // for this handler (unlike OrderCommandHandler): SingleWriterBoundaryTest
+        // found no legitimate direct caller beyond DisruptorOrderPipeline.
+        HotPathAssertions.require(HotPathAssertions.isWriterThreadOrStartupReplay(),
+                "ExecutionCommandHandler.handle() called from " + Thread.currentThread().getName()
+                        + ", not the OMS writer thread");
+        if (command.schemaVersion() != SCHEMA_VERSION) {
+            throw new IllegalArgumentException("Unsupported execution command schema version");
+        }
+        if (command.commandType() == com.emporia.events.TradingEvents.ExecutionCommandType.FILL) {
+            MemoryAnswer reference = cache.executionReferenceMemoryOnly(
+                    command.deskId(), command.venue(), command.executionReference());
+            if (reference == MemoryAnswer.UNCERTAIN) {
+                throw new HotPathUnavailableException("Execution deduplication state is not ready; retry");
+            }
+            if (reference == MemoryAnswer.DEFINITELY_EXISTS) return List.of();
+        }
+
+        // Cache-backed lookup: the child order is almost certainly warm.
+        Optional<TradingOrder> maybeOrder = findLiveOrAssumeTerminal(command.orderId(), command.deskId(),
+                () -> new IllegalArgumentException("Execution order was not found on its desk"));
+        if (maybeOrder.isEmpty()) return List.of();
+        TradingOrder order = maybeOrder.get();
+        List<OrderDomainEvent> result = new ArrayList<>();
+
+        switch (command.commandType()) {
+            case FILL -> applyFill(order, command, result);
+            case REJECT -> reject(order, command, result);
+            case CANCEL -> confirmCancel(order, command, result);
+            default -> throw new IllegalArgumentException("Unsupported execution command");
+        }
+        List<OrderDomainEvent> events = List.copyOf(result);
+        enqueueOutbox(events);
+        return events;
+    }
+
+    /**
+     * Same durability boundary as OrderCommandHandler.enqueueOutbox, for the
+     * fill/reject/cancel side: a rollup can touch several ancestors in one
+     * call, and every one of them needs to survive a crash between here and
+     * the outbox flush, not just the order the venue update was about.
+     */
+    private void enqueueOutbox(List<OrderDomainEvent> events) {
+        for (OrderDomainEvent event : events) {
+            if (shardedOrderDispatcher != null) {
+                shardedOrderDispatcher.dispatch(event);
+            }
+        }
+    }
+
+    private void applyFill(TradingOrder order, ExecutionCommand command, List<OrderDomainEvent> result) {
+        if (order.getStatus() == OrderStatus.FILLED || order.getStatus() == OrderStatus.REJECTED) return;
+
+        applyFillAndRecord(order, command.commandId(), command.executionReference(),
+                command.quantity(), command.price(), command.quantityScaled(), command.priceScaled(),
+                command.venue(), command.occurredAt(),
+                "Execution " + command.executionReference() + " received from " + command.venue(), result);
+
+        TradingOrder child = order;
+        UUID parentId = child.getParentOrderId();
+        while (parentId != null) {
+            // Ancestor rollup walk: parent lookup expected to be warm in cache.
+            Optional<TradingOrder> maybeParent = findLiveOrAssumeTerminal(parentId, child.getDeskId(),
+                    () -> new IllegalStateException("Parent order was not found on its desk"));
+            if (maybeParent.isEmpty()) break;
+            TradingOrder parent = maybeParent.get();
+            String rollupReference = rollupReference(command.executionReference(), parent.getId());
+            MemoryAnswer reference = cache.executionReferenceMemoryOnly(parent.getDeskId(), command.venue(), rollupReference);
+            if (reference == MemoryAnswer.UNCERTAIN) {
+                throw new HotPathUnavailableException("Execution deduplication state is not ready; retry");
+            }
+            if (reference == MemoryAnswer.DEFINITELY_NEW) {
+                applyFillAndRecord(parent, command.commandId(), rollupReference,
+                        command.quantity(), command.price(), command.quantityScaled(), command.priceScaled(),
+                        command.venue(), command.occurredAt(),
+                        "Child execution " + command.executionReference() + " rolled up from " + child.getId(),
+                        result);
+            }
+            child = parent;
+            parentId = parent.getParentOrderId();
+        }
+
+        if (isTerminal(order)) completePendingAncestors(order.getParentOrderId(), command, result);
+    }
+
+    private void applyFillAndRecord(TradingOrder order, UUID commandId, String reference,
+                                    BigDecimal quantity, BigDecimal price,
+                                    long quantityScaled, long priceScaled, String venue,
+                                    java.time.Instant occurredAt, String message,
+                                    List<OrderDomainEvent> result) {
+        order.applyFill(quantityScaled, priceScaled);
+        // Async, not executions.save(...): a synchronous JPA write here was the
+        // other thing that made this handler worse than OrderCommandHandler on
+        // the BLP (LMAX_ARCHITECTURE_REWORK_PLAN.md task 5.2). Same durability
+        // shape as every other row this handler writes - queued, not blocking.
+        asyncDbWriter.enqueue(new Execution(
+                deterministic(reference),
+                reference,
+                order,
+                quantity,
+                price,
+                venue,
+                occurredAt
+        ));
+        // Recorded only after the write is queued: remembering a reference the
+        // enqueue never reached would let a genuine retry of a lost write read
+        // as a duplicate and get silently dropped.
+        cache.rememberExecutionReference(order.getDeskId(), venue, reference);
+        cache.put(order);
+        asyncDbWriter.enqueue(order);
+        addEvent(commandId, order,
+                order.getStatus() == OrderStatus.FILLED ? "FILLED"
+                        : order.getStatus() == OrderStatus.CANCELLED ? "CANCELLED_FILL" : "PARTIALLY_FILLED",
+                message, result);
+        if (order.getStatus() == OrderStatus.FILLED) metrics.orderFilled();
+        if (order.getStatus() == OrderStatus.CANCELLED) metrics.orderCancelled();
+    }
+
+    /** Whether an order still has live children, answered from the complete live-order store. */
+    /**
+     * A live order, or an empty result the caller should silently back off
+     * from - never a repository read. {@link OrderStateCache#put} evicts a
+     * terminal order from the live store by design, so a miss here is
+     * ambiguous: genuinely unknown, or an order this instance already
+     * resolved. The dedup index remembers every id {@code put()} ever saw,
+     * live or terminal, so {@link MemoryAnswer#DEFINITELY_NEW} is what tells
+     * the two apart from memory alone - anything else (seen before, or the
+     * index not ready yet) is treated as "probably terminal, back off" rather
+     * than thrown, because a late or duplicate venue message for an order
+     * that already resolved is expected, not a bug this handler should raise
+     * on (LMAX_ARCHITECTURE_REWORK_PLAN.md task 7 review finding -
+     * {@code ignoreOpsOnAlreadyTerminalOrder}).
+     */
+    private Optional<TradingOrder> findLiveOrAssumeTerminal(UUID orderId, String deskId,
+            Supplier<RuntimeException> ifGenuinelyUnknown) {
+        Optional<TradingOrder> live = cache.findLiveByIdAndDeskMemoryOnly(orderId, deskId);
+        if (live.isPresent()) return live;
+        if (cache.existsByIdMemoryOnly(orderId) == MemoryAnswer.DEFINITELY_NEW) {
+            throw ifGenuinelyUnknown.get();
+        }
+        return Optional.empty();
+    }
+
+    private boolean hasLiveChildren(java.util.UUID parentId) {
+        return cache.liveChildrenMemoryOnly(parentId)
+                .orElseThrow(() -> new HotPathUnavailableException("Live-order index is not ready; retry"))
+                .stream().findAny().isPresent();
+    }
+
+    private void reject(TradingOrder order, ExecutionCommand command, List<OrderDomainEvent> result) {
+        if (isTerminal(order)) return;
+        order.reject(command.detail());
+        cache.put(order);
+        asyncDbWriter.enqueue(order);
+        addEvent(command.commandId(), order, "REJECTED", command.detail(), result);
+        metrics.orderRejected();
+        completePendingAncestors(order.getParentOrderId(), command, result);
+    }
+
+    private void confirmCancel(TradingOrder order, ExecutionCommand command, List<OrderDomainEvent> result) {
+        if (isTerminal(order)) return;
+
+        // A strategy parent is acknowledged only after every child is terminal.
+        // The execution service sends an acknowledgement when its scheduler is
+        // stopped; child venue acknowledgements then complete the parent.
+        if (!"DMA".equalsIgnoreCase(order.getDestination())
+                && hasLiveChildren(order.getId())) {
+            return;
+        }
+
+        order.confirmCancel();
+        cache.put(order);
+        asyncDbWriter.enqueue(order);
+        addEvent(command.commandId(), order, "CANCELLED",
+                blankToDefault(command.detail(), "Execution venue confirmed cancellation"), result);
+        metrics.orderCancelled();
+        completePendingAncestors(order.getParentOrderId(), command, result);
+    }
+
+    private void completePendingAncestors(UUID parentId, ExecutionCommand command,
+                                          List<OrderDomainEvent> result) {
+        UUID currentId = parentId;
+        while (currentId != null) {
+            // Ancestor walk: cache hit expected since child was just written above.
+            Optional<TradingOrder> maybeParent = findLiveOrAssumeTerminal(currentId, command.deskId(),
+                    () -> new IllegalStateException("Parent order was not found on its desk"));
+            if (maybeParent.isEmpty()) return;
+            TradingOrder parent = maybeParent.get();
+            if (parent.getTargetStatus() != OrderStatus.CANCELLED || isTerminal(parent)
+                    || hasLiveChildren(parent.getId())) {
+                return;
+            }
+            parent.confirmCancel();
+            cache.put(parent);
+            asyncDbWriter.enqueue(parent);
+            addEvent(command.commandId(), parent, "CANCELLED",
+                    "All child orders reached a terminal state", result);
+            metrics.orderCancelled();
+            currentId = parent.getParentOrderId();
+        }
+    }
+
+    private void addEvent(UUID commandId, TradingOrder order, String type, String message,
+                          List<OrderDomainEvent> result) {
+        OrderView view = order.view();
+        OrderEvent event = new OrderEvent(commandId, order, type, message, view);
+        asyncDbWriter.enqueue(event);
+        result.add(event.domainEvent());
+    }
+
+    private static boolean isTerminal(TradingOrder order) {
+        return order.getStatus() == OrderStatus.FILLED
+                || order.getStatus() == OrderStatus.CANCELLED
+                || order.getStatus() == OrderStatus.REJECTED;
+    }
+
+    private static String rollupReference(String childReference, UUID parentId) {
+        return "ROLLUP-" + parentId + "-"
+                + deterministic(childReference).toString().substring(0, 18);
+    }
+
+    private static String blankToDefault(String value, String defaultValue) {
+        return value == null || value.isBlank() ? defaultValue : value;
+    }
+
+    private static UUID deterministic(String value) {
+        return UUID.nameUUIDFromBytes(value.getBytes(StandardCharsets.UTF_8));
+    }
+}

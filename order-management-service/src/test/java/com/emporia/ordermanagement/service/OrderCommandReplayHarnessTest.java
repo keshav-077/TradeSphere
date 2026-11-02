@@ -1,0 +1,158 @@
+package com.emporia.ordermanagement.service;
+
+import com.emporia.events.TradingEvents.OrderCommand;
+import com.emporia.ordermanagement.model.OrderInputEvent;
+import com.emporia.ordermanagement.model.OrderInputEventStage;
+import com.emporia.ordermanagement.repository.OrderInputEventRepository;
+import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
+import tools.jackson.databind.ObjectMapper;
+
+import java.util.List;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.any;
+
+class OrderCommandReplayHarnessTest {
+    @Test
+    void replaysCommandsInSequenceOrder() throws Exception {
+        OrderInputEventRepository inputEvents = mock(OrderInputEventRepository.class);
+        OrderCommandHandler handler = mock(OrderCommandHandler.class);
+        ObjectMapper objectMapper = new ObjectMapper();
+        OrderCommandReplayHarness harness = new OrderCommandReplayHarness(inputEvents, handler, objectMapper, new MemoryMappedWalLogger(null, 1));
+
+        OrderCommand first = TestCommands.command(UUID.randomUUID());
+        OrderCommand second = TestCommands.command(UUID.randomUUID());
+        OrderInputEvent firstEvent = new OrderInputEvent(first, objectMapper.writeValueAsString(first));
+        OrderInputEvent secondEvent = new OrderInputEvent(second, objectMapper.writeValueAsString(second));
+        ReflectionTestUtils.setField(firstEvent, "sequenceId", 1L);
+        ReflectionTestUtils.setField(secondEvent, "sequenceId", 2L);
+
+        when(inputEvents.findAllByStageInOrderBySequenceIdAsc(org.mockito.ArgumentMatchers.anyList()))
+                .thenReturn(List.of(secondEvent, firstEvent));
+        when(handler.handle(first)).thenReturn(TestCommands.outcome(first.commandId()));
+        when(handler.handle(second)).thenReturn(TestCommands.outcome(second.commandId()));
+
+        assertThat(harness.replayAll())
+                .extracting(outcome -> outcome.result().commandId())
+                .containsExactly(first.commandId(), second.commandId());
+    }
+
+    @Test
+    void doesNotReplayReceivedOnlyAuditRows() throws Exception {
+        OrderInputEventRepository inputEvents = mock(OrderInputEventRepository.class);
+        OrderCommandHandler handler = mock(OrderCommandHandler.class);
+        ObjectMapper objectMapper = new ObjectMapper();
+        OrderCommand received = TestCommands.command(UUID.randomUUID());
+        OrderCommand accepted = TestCommands.command(UUID.randomUUID());
+        OrderInputEvent receivedEvent = new OrderInputEvent(
+                received, objectMapper.writeValueAsString(received), OrderInputEventStage.RECEIVED);
+        OrderInputEvent acceptedEvent = new OrderInputEvent(
+                accepted, objectMapper.writeValueAsString(accepted), OrderInputEventStage.ACCEPTED);
+        ReflectionTestUtils.setField(receivedEvent, "sequenceId", 1L);
+        ReflectionTestUtils.setField(acceptedEvent, "sequenceId", 2L);
+        when(inputEvents.findAllByStageInOrderBySequenceIdAsc(org.mockito.ArgumentMatchers.anyList()))
+                .thenReturn(List.of(acceptedEvent));
+        when(handler.handle(any(OrderCommand.class))).thenReturn(TestCommands.outcome(accepted.commandId()));
+
+        OrderCommandReplayHarness harness = new OrderCommandReplayHarness(
+                inputEvents, handler, objectMapper, new MemoryMappedWalLogger(null, 1));
+
+        assertThat(harness.replayAll()).extracting(outcome -> outcome.result().commandId())
+                .containsExactly(accepted.commandId());
+        verify(handler, org.mockito.Mockito.never()).handle(received);
+        verify(inputEvents).findAllByStageInOrderBySequenceIdAsc(
+                List.of(OrderInputEventStage.ACCEPTED, OrderInputEventStage.APPLIED));
+    }
+
+    @Test
+    void replaysTheCommandsTheWriteAheadLogStillHolds() throws Exception {
+        String path = java.nio.file.Files.createTempDirectory("wal-replay")
+                .resolve("replay.log").toString();
+        OrderCommand pending = TestCommands.command(UUID.randomUUID());
+        try (MemoryMappedWalLogger writer = new MemoryMappedWalLogger(path, 1)) {
+            writer.append(com.emporia.events.sbe.SbeEncoderDecoder.encodeOrderCommand(pending));
+        }
+
+        OrderCommandHandler handler = mock(OrderCommandHandler.class);
+        try (MemoryMappedWalLogger recovered = new MemoryMappedWalLogger(path, 1)) {
+            OrderCommandReplayHarness harness = new OrderCommandReplayHarness(
+                    mock(OrderInputEventRepository.class), handler, new ObjectMapper(), recovered);
+
+            harness.replayWriteAheadLog();
+        }
+
+        // The order was accepted on the ring but not yet written when the
+        // process stopped, so the database has no record of it and the log is
+        // the only place it survives.
+        //
+        // Matched on identity rather than the whole record: fixed-point
+        // encoding normalises decimals to scale 6, so "0.01" comes back as
+        // "0.010000" - the same quantity, a different BigDecimal.
+        org.mockito.ArgumentCaptor<OrderCommand> replayed =
+                org.mockito.ArgumentCaptor.forClass(OrderCommand.class);
+        verify(handler).handle(replayed.capture());
+        assertThat(replayed.getValue().commandId()).isEqualTo(pending.commandId());
+        assertThat(replayed.getValue().orderId()).isEqualTo(pending.orderId());
+        assertThat(replayed.getValue().requestedAt()).isEqualTo(pending.requestedAt());
+        assertThat(replayed.getValue().quantity())
+                .isEqualByComparingTo(pending.quantity());
+    }
+
+    @Test
+    void replayedWalCommandsAreNotOverwrittenByLiveAppendsBeforeFlush() throws Exception {
+        String path = java.nio.file.Files.createTempDirectory("wal-replay-overwrite")
+                .resolve("replay-overwrite.log").toString();
+        OrderCommand replayed = TestCommands.command(UUID.randomUUID());
+        OrderCommand live = TestCommands.command(UUID.randomUUID());
+
+        try (MemoryMappedWalLogger crashedProcess = new MemoryMappedWalLogger(path, 1)) {
+            crashedProcess.append(com.emporia.events.sbe.SbeEncoderDecoder.encodeOrderCommand(replayed));
+            crashedProcess.force();
+        }
+
+        OrderCommandHandler handler = mock(OrderCommandHandler.class);
+        try (MemoryMappedWalLogger restartedProcess = new MemoryMappedWalLogger(path, 1)) {
+            OrderCommandReplayHarness harness = new OrderCommandReplayHarness(
+                    mock(OrderInputEventRepository.class), handler, new ObjectMapper(), restartedProcess);
+
+            harness.replayWriteAheadLog();
+
+            // This is the crash window: replay has handled the command, but
+            // AsyncDbWriter has not drained DB/outbox queues or compacted WAL.
+            restartedProcess.append(com.emporia.events.sbe.SbeEncoderDecoder.encodeOrderCommand(live));
+            restartedProcess.force();
+        }
+
+        try (MemoryMappedWalLogger secondRestart = new MemoryMappedWalLogger(path, 1)) {
+            java.util.List<OrderCommand> recovered = secondRestart.readPendingRecords().stream()
+                    .map(com.emporia.events.sbe.SbeEncoderDecoder::decodeOrderCommand)
+                    .toList();
+
+            assertThat(recovered)
+                    .extracting(OrderCommand::commandId)
+                    .containsExactly(replayed.commandId(), live.commandId());
+        }
+
+        org.mockito.ArgumentCaptor<OrderCommand> capturedReplay =
+                org.mockito.ArgumentCaptor.forClass(OrderCommand.class);
+        verify(handler).handle(capturedReplay.capture());
+        assertThat(capturedReplay.getValue().commandId()).isEqualTo(replayed.commandId());
+    }
+
+    @Test
+    void doesNothingWhenNoLogIsConfigured() {
+        OrderCommandHandler handler = mock(OrderCommandHandler.class);
+        OrderCommandReplayHarness harness = new OrderCommandReplayHarness(
+                mock(OrderInputEventRepository.class), handler, new ObjectMapper(),
+                new MemoryMappedWalLogger(null, 1));
+
+        assertThat(harness.replayWriteAheadLog()).isEmpty();
+        verifyNoInteractions(handler);
+    }
+}

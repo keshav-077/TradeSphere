@@ -1,0 +1,639 @@
+package com.emporia.ordermanagement.service;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
+import io.micrometer.core.instrument.Timer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.jspecify.annotations.Nullable;
+import com.emporia.ordermanagement.model.ProcessedCommand;
+import com.emporia.ordermanagement.model.TradingOrder;
+import com.emporia.ordermanagement.repository.ProcessedCommandRepository;
+import com.emporia.ordermanagement.repository.TradingOrderRepository;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+/**
+ * In-process write-through cache for {@link TradingOrder} and
+ * {@link ProcessedCommand} that removes the hot-path DB SELECTs.
+ *
+ * <h2>Motivation</h2>
+ * <p>Every command handler call previously issued 3–5 synchronous
+ * {@code SELECT} queries against PostgreSQL before touching the matching
+ * engine or emitting events. On a warm JVM each round-trip costs 1–5 ms, so
+ * a single {@code CREATE} command already accumulates 3–15 ms of pure DB
+ * wait before any business logic runs.
+ *
+ * <h2>Cache contract</h2>
+ * <ul>
+ *   <li><b>write-through</b>: every {@code put} writes to both the cache and
+ *       the repository in the same transaction scope. The DB remains the
+ *       system-of-record for durability and cross-instance reads.</li>
+ *   <li><b>read-through on miss</b>: a cache miss delegates to the
+ *       repository. This is what {@link RotatingDedupIndex} exists to avoid: a
+ *       {@code CREATE} carries freshly generated ids, so it misses every time -
+ *       measured at zero hits across 14,402 orders, costing 2.312 of the
+ *       handler's 2.405 ms on the single writer thread. When the index is
+ *       present and ready it answers "never seen" from memory and the
+ *       repository is not consulted - including for identifiers older than the
+ *       index's horizon, which is why that horizon is a correctness parameter
+ *       rather than a performance one.</li>
+ *   <li><b>single-instance authority</b>: deduplication is correct if and only
+ *       if exactly one instance accepts orders. The order path asks
+ *       {@code isPrimary()} in {@code DisruptorOrderPipeline} rather than
+ *       assuming it, but that answer is only worth what the elector behind it is
+ *       worth, and <b>neither provider in this repository excludes a second
+ *       machine</b>. See {@code CONFIGURATION.md}. HTTP read queries
+ *       ({@code GET /orders}) bypass the cache entirely and go straight to the
+ *       DB.</li>
+ * </ul>
+ *
+ * <p>An earlier version of this javadoc attributed single-instance authority to
+ * Kafka consumer-group partition assignment. Order intake moved in-process at
+ * {@code 67eaecf} and no Kafka listener remains in this service, so that basis
+ * had not existed for some time.
+ *
+ * <h2>Bounds</h2>
+ * <ul>
+ *   <li>{@code trading-orders}: no Caffeine size cap and no write-age expiry.
+ *       It is a live-order store: terminal orders leave it, and live orders stay
+ *       until they do.</li>
+ *   <li>{@code liveOrderMax}: new live orders are refused with 429 when the
+ *       store is full. The default is derived from heap size and can be
+ *       overridden with {@code emporia.orders.live-max}.</li>
+ *   <li>{@code processed-commands}: 50,000 entries, expire 24 h after write.
+ *       Dedup window matches the Idempotency-Key TTL expected by callers.</li>
+ * </ul>
+ */
+@Component
+public class OrderStateCache {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderStateCache.class);
+
+    /**
+     * How long a repeated {@code Idempotency-Key} is honoured as a retry rather
+     * than treated as a new request. This is a promise made to callers, and the
+     * deduplication horizon has to be at least as long or the system forgets a
+     * key it said it still honours - {@code DedupIndexConfig} refuses to start
+     * when it is not, which is why this is public rather than inlined below.
+     */
+    public static final Duration IDEMPOTENCY_KEY_TTL = Duration.ofHours(24);
+
+    private final Cache<UUID, TradingOrder> orders;
+    private final Cache<UUID, ProcessedCommand> processed;
+    private final TradingOrderRepository orderRepository;
+    private final ProcessedCommandRepository processedRepository;
+    // Both lookups run on the Disruptor writer thread, where cost multiplies by
+    // the whole queue depth rather than being absorbed in parallel. Tagged by
+    // source so a run says how often the read-through fallback actually fires:
+    // for a CREATE both ids are freshly generated, so it fires every time.
+    private final Timer processedFromCache;
+    private final Timer processedFromDb;
+    private final Timer processedFromIndex;
+    private final Timer existsFromCache;
+    private final Timer existsFromDb;
+    private final Timer existsFromIndex;
+    // HOT_PATH_JPA_PLAN.md task 1.2: whether CANCEL/CANCEL_ALL's child and desk
+    // lookups actually answer from the index was previously only inferable
+    // from isLiveSetComplete() plus absence of contrary evidence, never
+    // measured directly.
+    private final Timer cancelChildrenFromIndex;
+    private final Timer cancelChildrenFromDb;
+    private final Timer cancelDeskFromIndex;
+    private final Timer cancelDeskFromDb;
+    // LMAX_ARCHITECTURE_REWORK_PLAN.md task 5.2: execution-reference dedup was
+    // ExecutionCommandHandler's own direct, uncached JPA call on every fill -
+    // the one place it was genuinely worse than OrderCommandHandler, not just
+    // a degraded fallback. Shares the same RotatingDedupIndex filters as
+    // command/order dedup rather than a dedicated instance: DedupIndexConfig's
+    // own javadoc already treats multiple key spaces sharing one filter set as
+    // the design, not a compromise - "under-sizing is safe, it raises the
+    // false-positive rate."
+    private final Timer executionReferenceFromIndex;
+    private final Timer executionReferenceFromDb;
+    // Owns every filter, including the rotation that stops them growing for as
+    // long as the process runs, and every filter it holds has a single writer.
+    //
+    // Nullable for tests only. The bean is unconditional since the enabled flag
+    // was removed, so this is never null at runtime - but a null here restores
+    // the pure read-through behaviour, which is the seam the tests use to cover
+    // the path the index replaced.
+    private final @Nullable RotatingDedupIndex dedup;
+
+    /** Live orders admitted before new ones are refused. See {@link #atCapacity()}. */
+    private final long liveOrderMax;
+
+    /** See {@link #isLiveSetComplete()}. Written once, by the startup load. */
+    private volatile boolean liveSetComplete;
+    private volatile boolean executionReferencesReady;
+    private final Set<UUID> executionReferenceKeys = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Live children by parent, and live orders by desk.
+     *
+     * <p>Both hold ids rather than orders, so the store above stays the single
+     * copy of any order's state. Both are maintained under the map's own bin
+     * lock via {@code compute}, because {@link #put} is called from the single
+     * writer <b>and</b> from the execution dispatcher's threads.
+     *
+     * <p>Neither is consulted unless {@link #isLiveSetComplete()} - an index
+     * over a partial store answers with what happens to be in it, which is the
+     * defect this whole store exists to remove.
+     */
+    private final Map<UUID, Set<UUID>> liveChildrenByParent = new ConcurrentHashMap<>();
+    private final Map<String, Set<UUID>> liveOrdersByDesk = new ConcurrentHashMap<>();
+
+    public OrderStateCache(
+            TradingOrderRepository orderRepository,
+            ProcessedCommandRepository processedRepository,
+            OrderMetrics metrics,
+            @Nullable RotatingDedupIndex dedup,
+            @Value("${emporia.orders.live-max:-1}") long liveOrderMax,
+            @Value("${emporia.cache.processed-max-size:50000}") long processedMaxSize) {
+        this.liveOrderMax = liveOrderMax > 0 ? liveOrderMax : deriveLiveOrderMax();
+        this.orderRepository = orderRepository;
+        this.processedRepository = processedRepository;
+        this.dedup = dedup;
+        this.processedFromIndex = metrics.registry().timer("emporia.oms.cache.lookup", "check", "processed", "source", "index");
+        this.existsFromIndex = metrics.registry().timer("emporia.oms.cache.lookup", "check", "exists", "source", "index");
+        this.processedFromCache = metrics.registry().timer("emporia.oms.cache.lookup", "check", "processed", "source", "cache");
+        this.processedFromDb = metrics.registry().timer("emporia.oms.cache.lookup", "check", "processed", "source", "db");
+        this.existsFromCache = metrics.registry().timer("emporia.oms.cache.lookup", "check", "exists", "source", "cache");
+        this.existsFromDb = metrics.registry().timer("emporia.oms.cache.lookup", "check", "exists", "source", "db");
+        this.cancelChildrenFromIndex = metrics.registry().timer("emporia.oms.cache.lookup", "check", "cancel_children", "source", "index");
+        this.cancelChildrenFromDb = metrics.registry().timer("emporia.oms.cache.lookup", "check", "cancel_children", "source", "db");
+        this.cancelDeskFromIndex = metrics.registry().timer("emporia.oms.cache.lookup", "check", "cancel_desk", "source", "index");
+        this.cancelDeskFromDb = metrics.registry().timer("emporia.oms.cache.lookup", "check", "cancel_desk", "source", "db");
+        this.executionReferenceFromIndex = metrics.registry().timer("emporia.oms.cache.lookup", "check", "execution_reference", "source", "index");
+        this.executionReferenceFromDb = metrics.registry().timer("emporia.oms.cache.lookup", "check", "execution_reference", "source", "db");
+        // No maximumSize and no expireAfterWrite: this is a live-order store, not
+        // a cache. Both of those evicted orders that were still live - the size
+        // bound silently (137,435 live orders were observed against a 100,000
+        // default) and the one-hour expiry on every order that rested longer
+        // than an hour. Each eviction turned a later lookup into a blocking
+        // database read on the single writer, and made any index over this map
+        // answer from whatever happened to survive.
+        //
+        // What bounds it now is liveness: put() removes an order when it
+        // reaches a terminal status, and liveOrderMax refuses new orders rather
+        // than dropping existing ones. Refusing is visible; evicting a live
+        // order is not.
+        this.orders = Caffeine.newBuilder()
+                .recordStats()
+                .build();
+        this.processed = Caffeine.newBuilder()
+                .maximumSize(processedMaxSize)
+                .expireAfterWrite(IDEMPOTENCY_KEY_TTL)
+                .recordStats()
+                .build();
+        // recordStats() has been on since these caches were written and nothing
+        // read it, so how often either tier actually answers has never been
+        // visible - and both are sized by argument rather than by measurement.
+        // The processed tier is the one that needs the answer: 50,000 entries at
+        // ~900 bytes of payload each is more memory than the whole deduplication
+        // index, held to save a database read on a path only retries take, and
+        // it covers by count rather than by time - about seven minutes of
+        // traffic at 120 orders/sec against a client retry window of seconds.
+        // cache_gets_total{result="hit"} against {result="miss"} settles it.
+        CaffeineCacheMetrics.monitor(metrics.registry(), this.orders, "trading-orders");
+        CaffeineCacheMetrics.monitor(metrics.registry(), this.processed, "processed-commands");
+    }
+
+    // ── TradingOrder ──────────────────────────────────────────────────────────
+
+    /**
+     * Returns the cached order, falling through to the DB on a miss.
+     *
+     * <p>Uses the desk-scoped query so a cross-desk lookup attempt still
+     * returns {@link Optional#empty()} rather than a wrong order.
+     */
+    public Optional<TradingOrder> findByIdAndDeskId(UUID id, String deskId) {
+        TradingOrder cached = orders.getIfPresent(id);
+        if (cached != null) {
+            // Verify desk ownership without a DB round-trip.
+            return cached.getDeskId().equals(deskId) ? Optional.of(cached) : Optional.empty();
+        }
+        Optional<TradingOrder> fromDb = orderRepository.findByIdAndDeskId(id, deskId);
+        // Only live orders are admitted: a terminal order loaded here is being
+        // read on an error path and must not take a slot in the live store.
+        fromDb.filter(o -> !isTerminal(o.getStatus())).ifPresent(o -> orders.put(o.getId(), o));
+        return fromDb;
+    }
+
+    /**
+     * The live-order store's own answer, and only that - no repository
+     * fallback on a miss. LMAX_ARCHITECTURE_REWORK_PLAN.md task 7: the BLP
+     * handlers' own lookups (a live order they expect to already hold) never
+     * wanted {@link #findByIdAndDeskId}'s DB fallback in the first place -
+     * every call site there already throws a domain error on
+     * {@code Optional.empty()} rather than trying harder. That fallback stays
+     * for {@code OrderQueryController}, an HTTP read path with no writer-thread
+     * cost concern and a real reason to check the database on a miss.
+     */
+    public Optional<TradingOrder> findLiveByIdAndDeskMemoryOnly(UUID id, String deskId) {
+        TradingOrder cached = orders.getIfPresent(id);
+        if (cached == null) return Optional.empty();
+        return cached.getDeskId().equals(deskId) ? Optional.of(cached) : Optional.empty();
+    }
+
+    /** Returns {@code true} when an order with this id exists (any desk). */
+    public boolean existsById(UUID id) {
+        long started = System.nanoTime();
+        if (orders.getIfPresent(id) != null) {
+            existsFromCache.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            return true;
+        }
+        if (indexAnswers() && dedup.definitelyNew(id)) {
+            existsFromIndex.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            return false;
+        }
+        boolean exists = orderRepository.existsById(id);
+        existsFromDb.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+        return exists;
+    }
+
+    /**
+     * The live-order store and dedup index's own answer, and only that.
+     * {@link MemoryAnswer#UNCERTAIN} - the index is not ready, or a Bloom
+     * filter "maybe seen" - is not resolved here; deciding what a BLP handler
+     * does with it is task 8's deterministic reject/retry, not this method's
+     * job. Not yet called from the BLP (task 7 adds this method; switching
+     * {@link #existsById}'s two callers over is task 8, once "uncertain" has
+     * somewhere principled to go other than this same database read).
+     */
+    public MemoryAnswer existsByIdMemoryOnly(UUID id) {
+        if (orders.getIfPresent(id) != null) return MemoryAnswer.DEFINITELY_EXISTS;
+        if (indexAnswers() && dedup.definitelyNew(id)) return MemoryAnswer.DEFINITELY_NEW;
+        return MemoryAnswer.UNCERTAIN;
+    }
+
+    /**
+     * Whether {@code executionReference}, scoped to {@code deskId}/{@code venue},
+     * has already been applied - the same fallback shape as {@link #existsById}:
+     * the dedup index can only answer "definitely new" with confidence (a Bloom
+     * filter has no false negatives), so "maybe seen" falls through to
+     * {@code dbFallback} rather than being treated as a confirmed duplicate.
+     *
+     * <p>Keyed on all three fields, not the bare reference: Postgres's own
+     * uniqueness constraint on {@code execution_reference} is a single global
+     * column, which assumes references are unique across every venue - nothing
+     * in this codebase guarantees that today, so the in-memory index is
+     * deliberately stricter than the schema it fronts.
+     */
+    public boolean existsExecutionReference(String deskId, String venue, String executionReference,
+            Supplier<Boolean> dbFallback) {
+        long started = System.nanoTime();
+        if (indexAnswers() && dedup.definitelyNew(executionReferenceKey(deskId, venue, executionReference))) {
+            executionReferenceFromIndex.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            return false;
+        }
+        boolean exists = dbFallback.get();
+        executionReferenceFromDb.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+        return exists;
+    }
+
+    /** Returns the execution-reference answer without a repository fallback. */
+    public MemoryAnswer executionReferenceMemoryOnly(String deskId, String venue, String executionReference) {
+        UUID key = executionReferenceKey(deskId, venue, executionReference);
+        if (!executionReferencesReady) return MemoryAnswer.UNCERTAIN;
+        if (executionReferenceKeys.contains(key)) return MemoryAnswer.DEFINITELY_EXISTS;
+        if (indexAnswers() && dedup.definitelyNew(key)) return MemoryAnswer.DEFINITELY_NEW;
+        return MemoryAnswer.UNCERTAIN;
+    }
+
+    /** Marks {@code executionReference} as applied, so a repeat is recognised without the database. */
+    public void rememberExecutionReference(String deskId, String venue, String executionReference) {
+        UUID key = executionReferenceKey(deskId, venue, executionReference);
+        executionReferenceKeys.add(key);
+        if (dedup != null) dedup.remember(key);
+    }
+
+    void rememberExecutionReferenceKey(UUID key) {
+        executionReferenceKeys.add(key);
+    }
+
+    /** Publishes the exact execution-reference snapshot after warm-up completes. */
+    void markExecutionReferencesReady() {
+        executionReferencesReady = true;
+    }
+
+    private static UUID executionReferenceKey(String deskId, String venue, String executionReference) {
+        return UUID.nameUUIDFromBytes(
+                (deskId + '\u0000' + venue + '\u0000' + executionReference)
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Whether the index may be trusted to answer "never seen". False while the
+     * startup load is still running, because a partially filled filter reports
+     * "never seen" for things it has seen - see
+     * {@link RotatingDedupIndex#isReady()}.
+     */
+    private boolean indexAnswers() {
+        return dedup != null && dedup.isReady();
+    }
+
+    public boolean isReady() {
+        return indexAnswers();
+    }
+
+    /**
+     * Stores the order in the cache. Called after every successful
+     * {@code orders.save()} so the next read hits the cache.
+     */
+    public void put(TradingOrder order) {
+        // The one funnel every committed state change passes through, which is
+        // why the revision is stamped here rather than in the mutators - see
+        // TradingOrder.recordRevision. Read-through population uses the cache
+        // field directly and so does not reach this method.
+        order.recordRevision();
+        if (isTerminal(order.getStatus())) {
+            // A finished order is not live, and this store holds live orders.
+            // Leaving it here is how the store filled with orders nothing would
+            // ever act on again. It stays answerable through the read-through
+            // fallback, which is what lets a cancel of a filled order say 409
+            // rather than 404.
+            orders.invalidate(order.getId());
+            unindex(order);
+        } else {
+            orders.put(order.getId(), order);
+            index(order);
+        }
+        // Remembered either way: the deduplication index is about identifiers
+        // ever seen, not about orders still live.
+        if (dedup != null) dedup.remember(order.getId());
+    }
+
+    /** Orders currently live in memory. */
+    public long liveOrderCount() {
+        return orders.estimatedSize();
+    }
+
+    /**
+     * Whether the live-order store holds <b>every</b> live order, not merely the
+     * ones this process has seen since it started.
+     *
+     * <p>Nothing may answer a question negatively from this store until it is
+     * true. An index over a partially loaded store reports the orders that
+     * happened to be in it, which is the same defect the bounded cache had and
+     * the reason this store exists.
+     */
+    public boolean isLiveSetComplete() {
+        return liveSetComplete;
+    }
+
+    /**
+     * Admits an order loaded from the database during startup.
+     *
+     * <p>Deliberately not {@link #put}: that stamps a revision, and replaying
+     * existing rows into memory is not a state change. Terminal orders are
+     * skipped rather than rejected, so the caller may hand over whatever the
+     * query returned.
+     */
+    boolean admitExisting(TradingOrder order) {
+        if (isTerminal(order.getStatus())) {
+            return true;
+        }
+        // The cap has to bite here too, and it did not before: it was checked
+        // only where new orders are created, which is the path that admits one
+        // order at a time. The startup load admits hundreds of thousands at
+        // once and asked nobody, so it ran the heap out - the exact failure the
+        // cap exists to prevent, entering through the door it was not watching.
+        if (atCapacity()) {
+            return false;
+        }
+        orders.put(order.getId(), order);
+        index(order);
+        return true;
+    }
+
+    private void index(TradingOrder order) {
+        UUID parentId = order.getParentOrderId();
+        if (parentId != null) {
+            liveChildrenByParent.compute(parentId, (key, ids) -> {
+                Set<UUID> set = ids == null ? ConcurrentHashMap.newKeySet() : ids;
+                set.add(order.getId());
+                return set;
+            });
+        }
+        String deskId = order.getDeskId();
+        if (deskId != null) {
+            liveOrdersByDesk.compute(deskId, (key, ids) -> {
+                Set<UUID> set = ids == null ? ConcurrentHashMap.newKeySet() : ids;
+                set.add(order.getId());
+                return set;
+            });
+        }
+    }
+
+    private void unindex(TradingOrder order) {
+        UUID parentId = order.getParentOrderId();
+        if (parentId != null) {
+            liveChildrenByParent.computeIfPresent(parentId, (key, ids) -> {
+                ids.remove(order.getId());
+                return ids.isEmpty() ? null : ids;
+            });
+        }
+        String deskId = order.getDeskId();
+        if (deskId != null) {
+            liveOrdersByDesk.computeIfPresent(deskId, (key, ids) -> {
+                ids.remove(order.getId());
+                return ids.isEmpty() ? null : ids;
+            });
+        }
+    }
+
+    /**
+     * Live children of {@code parentId}, or empty when this store cannot answer.
+     *
+     * <p>{@link Optional#empty()} means "ask the database", not "no children" -
+     * the two are indistinguishable to a caller that only gets a list, and
+     * confusing them would silently skip cancelling a parent's children.
+     */
+    public Optional<List<TradingOrder>> liveChildrenMemoryOnly(UUID parentId) {
+        return resolve(liveChildrenByParent.get(parentId));
+    }
+
+    /** Live orders on {@code deskId}, newest first, or empty when this store cannot answer. */
+    public Optional<List<TradingOrder>> liveOrdersOnDeskMemoryOnly(String deskId) {
+        return resolve(liveOrdersByDesk.get(deskId))
+                .map(found -> found.stream()
+                        .sorted(java.util.Comparator.comparing(TradingOrder::getCreatedAt).reversed())
+                        .toList());
+    }
+
+    /**
+     * Live children of {@code parentId}, timed and tagged by whether the
+     * answer came from the index or {@code dbFallback} - the measurement
+     * HOT_PATH_JPA_PLAN.md task 1.2 asks for, so a run can show the fallback
+     * did not fire rather than assume it from {@link #isLiveSetComplete()}.
+     */
+    public List<TradingOrder> liveChildrenOf(UUID parentId, Supplier<List<TradingOrder>> dbFallback) {
+        long started = System.nanoTime();
+        Optional<List<TradingOrder>> fromIndex = liveChildrenMemoryOnly(parentId);
+        if (fromIndex.isPresent()) {
+            cancelChildrenFromIndex.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            return fromIndex.get();
+        }
+        List<TradingOrder> fromDb = dbFallback.get();
+        cancelChildrenFromDb.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+        return fromDb;
+    }
+
+    /** Live orders on {@code deskId}, newest first, with the same timing as {@link #liveChildrenOf(UUID, Supplier)}. */
+    public List<TradingOrder> liveOrdersOnDesk(String deskId, Supplier<List<TradingOrder>> dbFallback) {
+        long started = System.nanoTime();
+        Optional<List<TradingOrder>> fromIndex = liveOrdersOnDeskMemoryOnly(deskId);
+        if (fromIndex.isPresent()) {
+            cancelDeskFromIndex.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            return fromIndex.get();
+        }
+        List<TradingOrder> fromDb = dbFallback.get();
+        cancelDeskFromDb.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+        return fromDb;
+    }
+
+    private Optional<List<TradingOrder>> resolve(@Nullable Set<UUID> ids) {
+        if (!liveSetComplete) return Optional.empty();
+        if (ids == null) return Optional.of(List.of());
+        return Optional.of(ids.stream()
+                .map(orders::getIfPresent)
+                .filter(java.util.Objects::nonNull)
+                .toList());
+    }
+
+    /**
+     * Declares the startup load complete. Called only after every live order has
+     * been admitted - never after a partial load, for the reason on
+     * {@link #isLiveSetComplete()}.
+     */
+    void markLiveSetComplete() {
+        this.liveSetComplete = true;
+    }
+
+    /**
+     * Heap budget assumed for one live order, across every structure that holds
+     * it. Deliberately not the size of a {@code TradingOrder}: the same order is
+     * also resting in exchange-core's book, in this store's two indexes, and in
+     * the deduplication index, and all of them share one heap.
+     *
+     * <p>Calibrated, not guessed, from two runs on a 4 GB default heap:
+     * 188,666 live orders ran; 333,379 died with
+     * {@code OutOfMemoryError: Java heap space} during the startup load. 20 KB
+     * puts the derived cap at roughly 200,000 on that heap - inside the range
+     * that worked and well below the one that did not.
+     *
+     * <p>It is a budget, not a measurement of any object. Re-derive it if the
+     * order model grows or exchange-core's per-order footprint changes.
+     */
+    private static final long LIVE_ORDER_HEAP_BUDGET_BYTES = 20L * 1024L;
+
+    private static long deriveLiveOrderMax() {
+        long max = Runtime.getRuntime().maxMemory() / LIVE_ORDER_HEAP_BUDGET_BYTES;
+        log.info("Live-order store capacity derived from the heap: {} orders "
+                        + "({} MB max heap at {} KB budget per live order). "
+                        + "Override with emporia.orders.live-max.",
+                max, Runtime.getRuntime().maxMemory() / (1024 * 1024),
+                LIVE_ORDER_HEAP_BUDGET_BYTES / 1024);
+        return max;
+    }
+
+    /**
+     * Whether the live-order store is full.
+     *
+     * <p>Refusing a new order is the correct answer here and evicting an
+     * existing one is not: an evicted live order is one this service can no
+     * longer see, answer for, or cancel, and nothing would say so. The ring
+     * already makes the same trade when it fills, and answers 429.
+     */
+    public boolean atCapacity() {
+        return liveOrderCount() >= liveOrderMax;
+    }
+
+    private static boolean isTerminal(com.emporia.events.TradingEvents.OrderStatus status) {
+        return status == com.emporia.events.TradingEvents.OrderStatus.FILLED
+                || status == com.emporia.events.TradingEvents.OrderStatus.CANCELLED
+                || status == com.emporia.events.TradingEvents.OrderStatus.REJECTED;
+    }
+
+    // ── ProcessedCommand ──────────────────────────────────────────────────────
+
+    /**
+     * Returns the cached dedup result, falling through to the DB on a miss.
+     *
+     * <p>A DB miss means the command has not been processed before — the
+     * normal case on a warm instance.
+     */
+    public Optional<ProcessedCommand> findProcessedById(UUID commandId) {
+        long started = System.nanoTime();
+        ProcessedCommand cached = processed.getIfPresent(commandId);
+        if (cached != null) {
+            processedFromCache.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            return Optional.of(cached);
+        }
+        if (indexAnswers() && dedup.definitelyNew(commandId)) {
+            processedFromIndex.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            return Optional.empty();
+        }
+        Optional<ProcessedCommand> fromDb = processedRepository.findById(commandId);
+        fromDb.ifPresent(p -> processed.put(commandId, p));
+        processedFromDb.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+        return fromDb;
+    }
+
+    /** Stores the dedup result in the cache after persisting it to the DB. */
+    public void putProcessed(ProcessedCommand command) {
+        processed.put(command.result().commandId(), command);
+        // Remembered even while warming: a command processed during the load
+        // must be in the index by the time the load finishes, or the flip to
+        // ready would leave a hole exactly the size of the warm-up window.
+        if (dedup != null) dedup.remember(command.result().commandId());
+    }
+
+    /**
+     * The cache and dedup index's own answer, and only that - no repository
+     * fallback. Unlike {@link #existsByIdMemoryOnly}, a confirmed "seen
+     * before" is not enough on its own: idempotent replay needs the original
+     * {@link ProcessedCommand} payload, and the 50,000-entry Caffeine tier is
+     * smaller than the dedup index's own horizon, so "the index says seen"
+     * and "the cache has the value" are genuinely different facts. Not yet
+     * called from the BLP, same reasoning as {@link #existsByIdMemoryOnly}.
+     */
+    public ProcessedLookup findProcessedByIdMemoryOnly(UUID commandId) {
+        ProcessedCommand cached = processed.getIfPresent(commandId);
+        if (cached != null) return ProcessedLookup.found(cached);
+        if (indexAnswers() && dedup.definitelyNew(commandId)) return ProcessedLookup.definitelyNew();
+        return ProcessedLookup.uncertain();
+    }
+
+    /**
+     * {@link #value} is non-null exactly when {@link #answer} is
+     * {@code DEFINITELY_EXISTS} - the index can confirm "seen" without the
+     * cache holding the payload, so those two are kept as distinct states
+     * rather than collapsing "seen, no value" into {@code UNCERTAIN}.
+     */
+    public record ProcessedLookup(MemoryAnswer answer, @Nullable ProcessedCommand value) {
+        public static ProcessedLookup found(ProcessedCommand value) {
+            return new ProcessedLookup(MemoryAnswer.DEFINITELY_EXISTS, value);
+        }
+
+        public static ProcessedLookup definitelyNew() {
+            return new ProcessedLookup(MemoryAnswer.DEFINITELY_NEW, null);
+        }
+
+        public static ProcessedLookup uncertain() {
+            return new ProcessedLookup(MemoryAnswer.UNCERTAIN, null);
+        }
+    }
+}

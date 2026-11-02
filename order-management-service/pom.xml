@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.emporia</groupId><artifactId>emporia-services</artifactId><version>0.1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+    <artifactId>order-management-service</artifactId>
+    <properties>
+        <fray.version>0.9.0</fray.version>
+        <jqwik.version>1.10.1</jqwik.version>
+        <!-- exchange-core requires low-level JDK access. Applied to both the running
+             application (spring-boot-maven-plugin) and the test JVM (argLine). -->
+        <exchange-core.jvm.args>-XX:+UseZGC -XX:+AlwaysPreTouch -XX:MaxDirectMemorySize=1024m --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED --add-exports=java.base/jdk.internal.ref=ALL-UNNAMED --add-exports=java.base/jdk.internal.util=ALL-UNNAMED --add-exports=java.base/sun.nio.ch=ALL-UNNAMED --add-exports=jdk.unsupported/sun.misc=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED</exchange-core.jvm.args>
+        <argLine>${exchange-core.jvm.args}</argLine>
+    </properties>
+    <dependencies>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-opentelemetry</artifactId></dependency>
+        <dependency><groupId>com.emporia</groupId><artifactId>trading-contracts</artifactId><version>${project.version}</version></dependency>
+        <!-- Execution-service dependencies pulled in by the merge -->
+        <dependency><groupId>com.emporia</groupId><artifactId>emporia-ha-core</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>com.emporia</groupId><artifactId>emporia-algorithmic-strategies</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>com.emporia</groupId><artifactId>emporia-journal</artifactId><version>${project.version}</version></dependency>
+        <!--
+            JMH, test scope. The matching engine has never been measured: every
+            throughput number this project has is the HTTP path wrapped around
+            it, so "is exchange-core efficient" has had no evidence either way.
+            The benchmark class is named *Benchmark, which surefire's include
+            patterns do not match, so it never runs during mvn test.
+        -->
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- OMS existing dependencies -->
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-oauth2-resource-server</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
+        <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-registry-prometheus</artifactId></dependency>
+        <!-- 2.x required: the 1.x line does not start on Spring Boot 4 -->
+        <dependency>
+            <groupId>net.ttddyy.observation</groupId>
+            <artifactId>datasource-micrometer-spring-boot</artifactId>
+            <version>${datasource-micrometer.version}</version>
+        </dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-flyway</artifactId></dependency>
+        <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-database-postgresql</artifactId></dependency>
+        <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-validation</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-cache</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-restclient</artifactId></dependency>
+        <dependency>
+            <groupId>com.lmax</groupId>
+            <artifactId>disruptor</artifactId>
+            <version>3.4.4</version>
+        </dependency>
+        <dependency><groupId>io.aeron</groupId><artifactId>aeron-client</artifactId><version>1.44.0</version></dependency>
+        <dependency><groupId>org.agrona</groupId><artifactId>agrona</artifactId><version>1.21.2</version></dependency>
+        <dependency><groupId>io.aeron</groupId><artifactId>aeron-driver</artifactId><version>1.44.0</version><scope>test</scope></dependency>
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+        <!-- LMAX_ARCHITECTURE_REWORK_PLAN.md task 5.5: static enforcement that
+             production code outside DisruptorOrderPipeline cannot call the BLP
+             handlers or mutate order state directly. Test-only, no production
+             classpath impact. -->
+        <dependency><groupId>com.tngtech.archunit</groupId><artifactId>archunit-junit5</artifactId><version>1.3.0</version><scope>test</scope></dependency>
+        <dependency>
+            <groupId>net.jqwik</groupId>
+            <artifactId>jqwik</artifactId>
+            <version>${jqwik.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa-test</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-testcontainers</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.testcontainers</groupId><artifactId>testcontainers-junit-jupiter</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.testcontainers</groupId><artifactId>testcontainers-postgresql</artifactId><scope>test</scope></dependency>
+        <dependency>
+            <groupId>org.pastalab.fray</groupId>
+            <artifactId>fray-junit</artifactId>
+            <version>${fray.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <!-- exchange-core reaches into sun.nio.ch.DirectBuffer and jdk.internal.misc.VM.
+                         Without these flags the matching engine throws IllegalAccessError at runtime
+                         while orders still return 201 (the venue accepted them), producing fills that
+                         never happen and a silent portfolio path. -->
+                    <jvmArguments>${exchange-core.jvm.args}</jvmArguments>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+                <executions>
+                    <execution>
+                        <!--
+                            Test sources need JMH's processor as well as Lombok.
+                            Declaring annotationProcessorPaths at all replaces
+                            classpath discovery entirely, and JDK 23 onwards
+                            disables that discovery by default anyway - so a JMH
+                            benchmark compiles cleanly and then fails at run time
+                            with "Unable to find the resource /META-INF/BenchmarkList",
+                            which names neither cause.
+                        -->
+                        <id>default-testCompile</id>
+                        <goals><goal>testCompile</goal></goals>
+                        <configuration>
+                            <annotationProcessorPaths>
+                                <path>
+                                    <groupId>org.projectlombok</groupId>
+                                    <artifactId>lombok</artifactId>
+                                    <version>${lombok.version}</version>
+                                </path>
+                                <path>
+                                    <groupId>org.openjdk.jmh</groupId>
+                                    <artifactId>jmh-generator-annprocess</artifactId>
+                                    <version>1.37</version>
+                                </path>
+                            </annotationProcessorPaths>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!--
+                Resolves the mockito-core jar path into a property so surefire
+                below can load it as a real -javaagent, instead of Mockito's
+                inline mock maker self-attaching to the running JVM. Newer JDKs
+                progressively restrict dynamic self-attach (warned on this
+                build's JDK 25, outright fails as "Could not self-attach to
+                current VM" on this project's pinned JDK 21 - the self-attach
+                path was never reliable, this build just hadn't hit a JDK where
+                it fails yet).
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>resolve-mockito-agent</id>
+                        <phase>initialize</phase>
+                        <goals>
+                            <goal>properties</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!--
+                        @{argLine}, not ${argLine}: jacoco's prepare-agent sets
+                        this property at a point in the build where only the
+                        @{} token (resolved by surefire itself, not eagerly by
+                        Maven property substitution) picks up jacoco's actual
+                        computed value instead of an empty string.
+                    -->
+                    <argLine>@{argLine} -javaagent:${org.mockito:mockito-core:jar}</argLine>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+    <profiles>
+        <profile>
+            <id>postgres-it</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <includes>
+                                <include>**/TradingOrderPostgresPersistenceSpec.java</include>
+                                <include>**/AbsorbedConflictReportingSpec.java</include>
+                                <include>**/DurableOrderOutputPostgresSpec.java</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
+            Separate from postgres-it: ExecutionRingWiringSpec references
+            ExchangeCoreExecutionVenueGateway/RoutingExecutionVenueGateway,
+            which only compile under -Dmatching (the agency profile excludes
+            them). Folding it into postgres-it's includes would break
+            `mvn test -Ppostgres-it` on its own, since that combination does
+            not imply -Dmatching. Compose the two instead:
+            `mvn test -Dmatching -Pring-wiring-it`.
+        -->
+        <profile>
+            <id>ring-wiring-it</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <includes>
+                                <include>**/ExecutionRingWiringSpec.java</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>fray</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.pastalab.fray.maven</groupId>
+                        <artifactId>fray-plugins-maven</artifactId>
+                        <version>${fray.version}</version>
+                        <executions>
+                            <execution>
+                                <id>prepare-fray</id>
+                                <goals>
+                                    <goal>prepare-fray</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <includes>
+                                <include>**/TradingOrderFraySpec.java</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
+            The AGENCY artifact, and it is the DEFAULT. It routes every order to
+            an external venue and cannot match one internally, because the
+            matching engine is not in it. Its counterpart is the MATCHING
+            profile above, selected with -Dmatching.
+
+            The two are products, not deployment options. Equities (listed
+            stock) is agency: Emporia is the customer of a venue and never the
+            counterparty of its own client. Crypto is matching, and B2C - the
+            client is matched against Emporia's own capital, never against
+            another client. See docs/FOUR_USE_CASES.md.
+
+            Why agency is the default, and not matching: forgetting a flag must
+            not hand you the artifact that can trade the firm's own capital.
+            InternalisationPolicy states the principle - "the safe answer is the
+            one you get by not thinking about it, and the unsafe answer has to
+            be written down where an auditor can see it" - and a matching
+            default contradicted it. The two mistakes are not symmetric:
+            building matching and deploying it as equities produces a jar that
+            CAN internalise, caught only if a jurisdiction was declared, so it
+            fails silently; building agency and running it as crypto fails at
+            startup with a sentence naming the build. Default to the loud one.
+
+            Why this used to be called `vn`: the axis was built for one
+            jurisdiction, listed securities in Vietnam having to trade through
+            the Exchange. The mechanism it produced - an artifact that cannot
+            match internally - turned out to BE the equities product. Vietnam is
+            one deployment of this artifact, not the reason for it. Jurisdiction
+            is now purely runtime configuration
+            (emporia.compliance.jurisdiction), which is where
+            InternalisationPolicy already reads it and always did.
+
+            Activated by property (!matching / -Dmatching) rather than
+            activeByDefault or -P: activeByDefault is switched off the moment
+            any other -P is passed, so a `-P postgres-it` build would silently
+            change which artifact you get. Property activation composes instead
+            of competing.
+
+            `matching` is a FLAG, not a boolean: Maven activates on the property
+            being DEFINED, whatever its value, so -Dmatching=false also selects
+            the matching build. Omit the flag for agency; do not write
+            -Dmatching=false. Making it value-sensitive was considered and is
+            worse - -Dmatching=false would then match neither profile, dropping
+            exchange-core without excluding the sources that import it, and the
+            result reads as a broken build rather than a wrong flag. The
+            finalName below is the safety net instead: the agency jar carries
+            -agency- in its name, so the one that cannot internalise is the one
+            you can identify.
+
+            Why an artifact and not just configuration: InternalisationPolicy
+            already refuses to start a deployment that may not internalise, and
+            for most purposes that is enough. What it cannot give is proof at the
+            artifact level - configuration can be changed after an audit, a
+            binary can be hashed. This profile builds a jar that contains neither
+            exchange-core nor the gateway that drives it, so "this deployment
+            cannot match client orders internally" is verifiable by inspecting
+            the artifact rather than by trusting a property.
+        -->
+        <profile>
+            <id>matching</id>
+            <activation>
+                <property><name>matching</name></property>
+            </activation>
+            <dependencies>
+                <dependency>
+                    <groupId>exchange.core2</groupId>
+                    <artifactId>exchange-core</artifactId>
+                    <version>0.5.8-emporia</version>
+                    <exclusions>
+                        <exclusion>
+                            <groupId>org.slf4j</groupId>
+                            <artifactId>slf4j-api</artifactId>
+                        </exclusion>
+                    </exclusions>
+                </dependency>
+            </dependencies>
+        </profile>
+
+        <profile>
+            <id>agency</id>
+            <activation>
+                <property><name>!matching</name></property>
+            </activation>
+            <build>
+                <finalName>${project.artifactId}-agency-${project.version}</finalName>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-compiler-plugin</artifactId>
+                        <configuration>
+                            <!--
+                                Everything that imports exchange.core2, plus
+                                everything that references those classes. The set
+                                is closed: ExecutionEventConsumer mentions the
+                                gateway only in a javadoc {@link}, which does not
+                                bind at compile time.
+                            -->
+                            <excludes>
+                                <exclude>**/execution/ExchangeCoreExecutionVenueGateway.java</exclude>
+                                <exclude>**/execution/ExchangeCoreLifecycleRebuilder.java</exclude>
+                                <exclude>**/execution/pool/OrderCommandObjectPool.java</exclude>
+                            </excludes>
+                            <testExcludes>
+                                <testExclude>**/execution/ExchangeCoreExecutionVenueGatewayTest.java</testExclude>
+                                <testExclude>**/execution/ExchangeCoreLifecycleRebuilderTest.java</testExclude>
+                                <testExclude>**/execution/pool/OrderCommandObjectPoolTest.java</testExclude>
+                                <!-- Drives exchange-core directly, so it cannot compile without it. -->
+                                <testExclude>**/execution/benchmark/MatchingEngineBenchmark.java</testExclude>
+                            </testExcludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

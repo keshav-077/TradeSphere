@@ -1,0 +1,26 @@
+========================================
+  TradeSphere - Folder Rename Commands
+========================================
+
+To complete the rebranding, rename the folder from "emporia-main" to "tradesphere"
+
+------------------------
+WINDOWS (CMD)
+------------------------
+cd c:\Github-all-repos
+rename emporia-main tradesphere
+
+------------------------
+WINDOWS (PowerShell)
+------------------------
+Rename-Item -Path "c:\Github-all-repos\emporia-main" -NewName "tradesphere"
+
+------------------------
+After Renaming
+------------------------
+New path will be:
+c:\Github-all-repos\tradesphere\
+
+Open the project in your IDE from this new location.
+
+========================================

@@ -1,0 +1,357 @@
+x-spring-healthcheck: &spring-healthcheck
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 20s
+
+x-postgres-env: &postgres-env
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: admin123
+
+x-postgres-healthcheck: &postgres-healthcheck
+  test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+  interval: 5s
+  timeout: 5s
+  retries: 10
+
+# Applied to every service that emits traces (REWORK_NOTE Phase 1_1).
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_TRACE_SAMPLE_RATE: ${OTEL_TRACE_SAMPLE_RATE:-1.0}
+
+services:
+  authentication-postgres:
+    image: postgres:16-alpine
+    container_name: emporia-authentication-postgres
+    environment:
+      <<: *postgres-env
+      POSTGRES_DB: emporia_authentication
+    ports:
+      - "5433:5432"
+    volumes:
+      - emporia-authentication-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+
+  static-data-postgres:
+    image: postgres:16-alpine
+    container_name: emporia-static-data-postgres
+    environment:
+      <<: *postgres-env
+      POSTGRES_DB: emporia_static_data
+    ports:
+      - "5434:5432"
+    volumes:
+      - emporia-static-data-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+
+  user-preferences-postgres:
+    image: postgres:16-alpine
+    container_name: emporia-user-preferences-postgres
+    environment:
+      <<: *postgres-env
+      POSTGRES_DB: emporia_user_preferences
+    ports:
+      - "5435:5432"
+    volumes:
+      - emporia-user-preferences-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+
+  order-management-postgres:
+    image: postgres:16-alpine
+    container_name: emporia-order-management-postgres
+    environment:
+      <<: *postgres-env
+      POSTGRES_DB: emporia_order_management
+    ports:
+      - "5436:5432"
+    volumes:
+      - emporia-order-management-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+
+  execution-postgres:
+    image: postgres:16-alpine
+    container_name: emporia-execution-postgres
+    environment:
+      <<: *postgres-env
+      POSTGRES_DB: emporia_execution
+    ports:
+      - "5437:5432"
+    volumes:
+      - emporia-execution-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+
+  portfolio-postgres:
+    image: postgres:16-alpine
+    container_name: emporia-portfolio-postgres
+    environment:
+      <<: *postgres-env
+      POSTGRES_DB: emporia_portfolio
+    ports:
+      - "5438:5432"
+    volumes:
+      - emporia-portfolio-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+
+  authentication:
+    build:
+      context: ./authentication
+    container_name: emporia-authentication
+    ports:
+      - "9000:9000"
+    environment:
+      DB_URL: jdbc:postgresql://authentication-postgres:5432/emporia_authentication
+      DB_USERNAME: postgres
+      DB_PASSWORD: admin123
+      AUTH_ISSUER: http://localhost:3000
+      OAUTH_REDIRECT_URI: http://localhost:3000/auth/callback
+      OAUTH_POST_LOGOUT_REDIRECT_URI: http://localhost:3000/auth/logout-callback
+      BOOTSTRAP_ADMIN_ENABLED: "true"
+      BOOTSTRAP_ADMIN_USERNAME: admin
+      BOOTSTRAP_ADMIN_EMAIL: admin@localhost
+      BOOTSTRAP_ADMIN_PASSWORD: admin123
+      BOOTSTRAP_ADMIN_DESK: default
+      BOOTSTRAP_ADMIN_CAN_TRADE: "true"
+    depends_on:
+      authentication-postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *spring-healthcheck
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9000/actuator/health || exit 1"]
+
+  static-data-service:
+    build:
+      context: ./static-data-service
+    container_name: emporia-static-data
+    ports:
+      - "8081:8081"
+    environment:
+      DB_URL: jdbc:postgresql://static-data-postgres:5432/emporia_static_data
+      DB_USERNAME: postgres
+      DB_PASSWORD: admin123
+      EMPORIA_AUTH_ISSUER: http://localhost:3000
+      EMPORIA_AUTH_JWK_SET_URI: http://authentication:9000/oauth2/jwks
+    depends_on:
+      static-data-postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *spring-healthcheck
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8081/actuator/health || exit 1"]
+
+  user-preferences-service:
+    build:
+      context: ./user-preferences-service
+    container_name: emporia-user-preferences
+    ports:
+      - "8083:8083"
+    environment:
+      DB_URL: jdbc:postgresql://user-preferences-postgres:5432/emporia_user_preferences
+      DB_USERNAME: postgres
+      DB_PASSWORD: admin123
+      EMPORIA_STATIC_DATA_URL: http://static-data-service:8081
+      EMPORIA_AUTH_ISSUER: http://localhost:3000
+      EMPORIA_AUTH_JWK_SET_URI: http://authentication:9000/oauth2/jwks
+    depends_on:
+      user-preferences-postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *spring-healthcheck
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8083/actuator/health || exit 1"]
+
+  market-data-service:
+    build:
+      context: ./market-data-service
+    container_name: emporia-market-data
+    ports:
+      - "8084:8084"
+      - "50551:50551"
+    environment:
+      <<: *otel-env
+      EMPORIA_STATIC_DATA_URL: http://static-data-service:8081
+      EMPORIA_AUTH_TOKEN_URL: http://authentication:9000/oauth2/token
+      EMPORIA_AUTH_ISSUER: http://localhost:3000
+      EMPORIA_AUTH_JWK_SET_URI: http://authentication:9000/oauth2/jwks
+      MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-simulated}
+      APCA_API_KEY_ID: ${APCA_API_KEY_ID:-}
+      APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY:-}
+    depends_on:
+      authentication:
+        condition: service_healthy
+      static-data-service:
+        condition: service_healthy
+    healthcheck:
+      <<: *spring-healthcheck
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8084/actuator/health || exit 1"]
+
+  order-management-service:
+    build:
+      context: ./order-management-service
+    container_name: emporia-order-management
+    ports:
+      - "8086:8086"
+    environment:
+      JAVA_OPTS: "-XX:+UseZGC -XX:+AlwaysPreTouch -XX:MaxDirectMemorySize=1024m --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED --add-exports=java.base/jdk.internal.ref=ALL-UNNAMED --add-exports=java.base/jdk.internal.util=ALL-UNNAMED --add-exports=java.base/sun.nio.ch=ALL-UNNAMED --add-exports=jdk.unsupported/sun.misc=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED"
+      <<: *otel-env
+      DB_URL: jdbc:postgresql://order-management-postgres:5432/emporia_order_management
+      EXECUTION_DB_URL: jdbc:postgresql://execution-postgres:5432/emporia_execution
+      DB_USERNAME: postgres
+      DB_PASSWORD: admin123
+      EMPORIA_STATIC_DATA_URL: http://static-data-service:8081
+      EMPORIA_AUTH_ISSUER: http://localhost:3000
+      EMPORIA_AUTH_JWK_SET_URI: http://authentication:9000/oauth2/jwks
+    depends_on:
+      order-management-postgres:
+        condition: service_healthy
+      execution-postgres:
+        condition: service_healthy
+      authentication:
+        condition: service_healthy
+      static-data-service:
+        condition: service_healthy
+    healthcheck:
+      <<: *spring-healthcheck
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8086/actuator/health || exit 1"]
+
+  portfolio-service:
+    build:
+      context: ./portfolio-service
+    container_name: emporia-portfolio
+    ports:
+      - "8088:8088"
+    environment:
+      <<: *otel-env
+      DB_URL: jdbc:postgresql://portfolio-postgres:5432/emporia_portfolio
+      DB_USERNAME: postgres
+      DB_PASSWORD: admin123
+      EMPORIA_AUTH_ISSUER: http://localhost:3000
+      EMPORIA_AUTH_JWK_SET_URI: http://authentication:9000/oauth2/jwks
+    depends_on:
+      portfolio-postgres:
+        condition: service_healthy
+      authentication:
+        condition: service_healthy
+    healthcheck:
+      <<: *spring-healthcheck
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8088/actuator/health || exit 1"]
+
+  gateway:
+    build:
+      context: ./gateway
+    container_name: emporia-gateway
+    ports:
+      - "8082:8082"
+    environment:
+      JAVA_TOOL_OPTIONS: -Dnetworkaddress.cache.ttl=5 -Dnetworkaddress.cache.negative.ttl=1
+      SERVER_PORT: "8082"
+      EMPORIA_AUTH_ISSUER: http://localhost:3000
+      EMPORIA_AUTH_JWK_SET_URI: http://authentication:9000/oauth2/jwks
+      EMPORIA_AUTH_URL: http://authentication:9000
+      EMPORIA_STATIC_DATA_URL: http://static-data-service:8081
+      EMPORIA_USER_PREFERENCES_URL: http://user-preferences-service:8083
+      EMPORIA_MARKET_DATA_URL: http://market-data-service:8084
+      EMPORIA_ORDER_MANAGEMENT_URL: http://order-management-service:8086
+      EMPORIA_PORTFOLIO_URL: http://portfolio-service:8088
+    depends_on:
+      authentication:
+        condition: service_healthy
+      static-data-service:
+        condition: service_healthy
+      user-preferences-service:
+        condition: service_healthy
+      market-data-service:
+        condition: service_healthy
+      order-management-service:
+        condition: service_healthy
+      portfolio-service:
+        condition: service_healthy
+    healthcheck:
+      <<: *spring-healthcheck
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8082/actuator/health || exit 1"]
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: emporia-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # --- Observability (REWORK_NOTE Phase 1_1) -------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    container_name: emporia-otel-collector
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./deploy/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: emporia-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    user: "0:0"
+    volumes:
+      - ./deploy/otel/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - emporia-tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: emporia-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+      # See docker-compose.yml: without this Prometheus discards the trace_id
+      # exemplars the services already emit, breaking the jump from a latency
+      # spike to an example trace.
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./deploy/otel/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/otel/alerts:/etc/prometheus/alerts:ro
+      - emporia-prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: emporia-grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./deploy/otel/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/emporia.yaml:ro
+      - ./deploy/otel/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/emporia.yaml:ro
+      - ./deploy/otel/dashboards:/etc/grafana/provisioning/dashboards/emporia:ro
+      - emporia-grafana-data:/var/lib/grafana
+    ports:
+      # 3000 is taken by the frontend in this compose file.
+      - "3300:3000"
+    depends_on:
+      - tempo
+      - prometheus
+
+volumes:
+  emporia-authentication-postgres-data:
+  emporia-static-data-postgres-data:
+  emporia-user-preferences-postgres-data:
+  emporia-order-management-postgres-data:
+  emporia-execution-postgres-data:
+  emporia-portfolio-postgres-data:
+  emporia-tempo-data:
+  emporia-prometheus-data:
+  emporia-grafana-data:

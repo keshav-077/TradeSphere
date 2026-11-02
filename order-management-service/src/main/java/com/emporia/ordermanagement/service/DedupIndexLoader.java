@@ -1,0 +1,144 @@
+package com.emporia.ordermanagement.service;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import java.sql.Timestamp;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.UUID;
+import java.util.function.Consumer;
+
+/**
+ * Fills {@link CommandDedupIndex} from Postgres so the hot path can stop asking
+ * it questions one order at a time.
+ *
+ * <p>The point is the shape of the access, not its speed: one bulk read at
+ * startup replaces a per-order round trip that costs 1.313 ms on the single
+ * writer thread, where it multiplies by the queue depth.
+ *
+ * <h2>Both key spaces, because the index answers two questions</h2>
+ * <p>{@code commandId} decides idempotency; {@code orderId} decides the 409
+ * duplicate-order guard. An earlier version loaded only the first, so after a
+ * restart every pre-existing orderId read as "never seen" and the guard was
+ * silently off - a false negative, the one direction that matters.
+ *
+ * <p>The order side has two arms. The window arm mirrors the command side.
+ * The tree arm ignores age deliberately: strategy child slices carry
+ * deterministic ids derived from their parent, so a parent outliving the horizon
+ * regenerates ids the window no longer holds, and the writer upserts rather than
+ * failing on the primary key - the duplicate would revert a filled order to live
+ * with nothing traded instead of being rejected.
+ *
+ * <p>It loads whole trees rather than only the orders still working, because the
+ * ids at risk belong to the <i>children</i>, which go terminal long before the
+ * parent does. A top-level order is its own root, so this covers every working
+ * order on its own.
+ *
+ * <p>Reads only the identifier column. The rest of the row is the previous
+ * result, which matters solely for a retry inside the client's retry window -
+ * and that window is served by the exact tier, populated as commands are
+ * processed. A window's worth of payloads would be gigabytes for a question
+ * that is only ever "yes or no".
+ *
+ * <p>Bounded by {@code processed_at}, {@code created_at} and
+ * {@code root_order_id}, which the V10, V11 and V12 indexes support. That is sound because exactly one instance accepts
+ * orders, so every row in the window came from a single clock - enforced on the
+ * order path, not assumed.
+ */
+public class DedupIndexLoader {
+
+    private static final Logger log = LoggerFactory.getLogger(DedupIndexLoader.class);
+
+    private static final String SELECT_COMMANDS = """
+            SELECT command_id
+              FROM emporia_order_data.processed_order_command
+             WHERE processed_at > ?
+            """;
+
+    private static final String SELECT_RECENT_ORDERS = """
+            SELECT id
+              FROM emporia_order_data.trading_order
+             WHERE created_at > ?
+            """;
+
+    private static final String SELECT_WORKING_TREES = """
+            SELECT id
+              FROM emporia_order_data.trading_order
+             WHERE root_order_id IN (SELECT root_order_id
+                                       FROM emporia_order_data.trading_order
+                                      WHERE order_status IN ('LIVE', 'PARTIALLY_FILLED'))
+            """;
+
+    private static final String SELECT_EXECUTION_REFERENCES = """
+            SELECT o.desk_id, e.venue, e.execution_reference
+              FROM emporia_order_data.execution e
+              JOIN emporia_order_data.trading_order o ON o.id = e.order_id
+            """;
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public DedupIndexLoader(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    /**
+     * Streams the window's identifiers into {@code index} and returns how many
+     * were loaded across both key spaces.
+     *
+     * <p>Streamed rather than collected: a day at 120 orders/sec is over ten
+     * million ids per key space, and materialising them into a list before
+     * inserting them would cost more memory than the filter they are going
+     * into.
+     *
+     * <p>The count is reported rather than reconciled against a separate
+     * {@code COUNT(*)}. The two would legitimately disagree - this instance
+     * keeps processing orders while the load runs, and those are written to the
+     * index directly - so a mismatch would prove nothing. The working-order arm
+     * also overlaps the window arm, and a Bloom filter absorbs the repeat
+     * without noticing.
+     */
+    public long load(CommandDedupIndex index, Duration window) {
+        return load(index, window, ignored -> { });
+    }
+
+    public long load(CommandDedupIndex index, Duration window, Consumer<UUID> executionReferenceSink) {
+        Instant since = Instant.now().minus(window);
+        Timestamp from = Timestamp.from(since);
+        long started = System.nanoTime();
+
+        long commands = stream(SELECT_COMMANDS, index, from);
+        long recentOrders = stream(SELECT_RECENT_ORDERS, index, from);
+        long workingTrees = stream(SELECT_WORKING_TREES, index);
+        long executionReferences = streamExecutionReferences(SELECT_EXECUTION_REFERENCES, executionReferenceSink);
+
+        long elapsedMs = (System.nanoTime() - started) / 1_000_000;
+        log.info("Loaded {} processed commands, {} recent orders, {} orders in working trees and {} execution references "
+                        + "into the deduplication index in {} ms (window={}, since={})",
+                commands, recentOrders, workingTrees, executionReferences, elapsedMs, window, since);
+        return commands + recentOrders + workingTrees + executionReferences;
+    }
+
+    private long stream(String sql, CommandDedupIndex index, Object... arguments) {
+        long[] loaded = {0};
+        jdbcTemplate.query(sql, rs -> {
+            index.remember((UUID) rs.getObject(1));
+            loaded[0]++;
+        }, arguments);
+        return loaded[0];
+    }
+
+    private long streamExecutionReferences(String sql, Consumer<UUID> sink) {
+        long[] loaded = {0};
+        jdbcTemplate.query(sql, rs -> {
+            String desk = rs.getString(1);
+            String venue = rs.getString(2);
+            String reference = rs.getString(3);
+            sink.accept(UUID.nameUUIDFromBytes((desk + '\u0000' + venue + '\u0000' + reference)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            loaded[0]++;
+        });
+        return loaded[0];
+    }
+}

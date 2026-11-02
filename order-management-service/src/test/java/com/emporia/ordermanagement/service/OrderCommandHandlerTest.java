@@ -1,0 +1,717 @@
+package com.emporia.ordermanagement.service;
+
+import com.emporia.events.TradingEvents.CommandType;
+import com.emporia.events.TradingEvents.ListingSnapshot;
+import com.emporia.events.TradingEvents.OrderCommand;
+import com.emporia.events.TradingEvents.OrderCommandResult;
+import com.emporia.events.TradingEvents.OrderSide;
+import com.emporia.events.TradingEvents.OrderStatus;
+import com.emporia.events.TradingEvents.OrderType;
+import com.emporia.events.TradingEvents.OrderDomainEvent;
+import com.emporia.execution.ShardedOrderDispatcher;
+import com.emporia.ordermanagement.dto.ProcessingOutcome;
+import com.emporia.ordermanagement.model.OrderEvent;
+import com.emporia.ordermanagement.model.ProcessedCommand;
+import com.emporia.ordermanagement.model.TradingOrder;
+import com.emporia.ordermanagement.repository.OrderEventRepository;
+import com.emporia.ordermanagement.repository.ProcessedCommandRepository;
+import com.emporia.ordermanagement.repository.TradingOrderRepository;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.observation.ObservationRegistry;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
+import tools.jackson.databind.ObjectMapper;
+
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+import static com.emporia.events.TradingEvents.SCHEMA_VERSION;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+class OrderCommandHandlerTest {
+
+    private static final String USER = "trader-one";
+    private static final String DESK = "trader-one";
+
+    private final TradingOrderRepository orders = mock(TradingOrderRepository.class);
+    private final OrderEventRepository events = mock(OrderEventRepository.class);
+    private final ProcessedCommandRepository processed = mock(ProcessedCommandRepository.class);
+    private final MeterRegistry meters = new SimpleMeterRegistry();
+    private final ObservationRegistry observations = observationRegistry(meters);
+    private final OrderMetrics metrics = new OrderMetrics(new SimpleMeterRegistry());
+    private final OrderStateCache cache = new OrderStateCache(orders, processed, metrics, readyDedup(), 1000, 1000);
+    private final AsyncDbWriter asyncDbWriter = mock(AsyncDbWriter.class);
+    private final ShardedOrderDispatcher dispatcher = mock(ShardedOrderDispatcher.class);
+    private final OrderCommandHandler handler =
+            new OrderCommandHandler(orders, new ObjectMapper(), observations, metrics, cache, asyncDbWriter, dispatcher);
+
+    /**
+     * Wiring a meter handler turns observations into timers, so they can be
+     * asserted the same way {@code OrderMetricsTest} asserts gauges.
+     */
+    private static ObservationRegistry observationRegistry(MeterRegistry meters) {
+        ObservationRegistry registry = ObservationRegistry.create();
+        registry.observationConfig().observationHandler(new DefaultMeterObservationHandler(meters));
+        return registry;
+    }
+
+    @BeforeEach
+    void defaultNoCache() {
+        cache.markLiveSetComplete();
+        when(processed.findById(any())).thenReturn(Optional.empty());
+        when(events.save(any(OrderEvent.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(orders.save(any(TradingOrder.class))).thenAnswer(inv -> {
+            TradingOrder o = inv.getArgument(0);
+            ReflectionTestUtils.setField(o, "version", o.getVersion() == null ? 1L : o.getVersion() + 1);
+            return o;
+        });
+        when(orders.count()).thenReturn(0L);
+        when(orders.countByStatusIn(any())).thenReturn(0L);
+        when(orders.countByStatus(any())).thenReturn(0L);
+        when(orders.countByTargetStatusAndStatusIn(any(), any())).thenReturn(0L);
+    }
+
+    // -------------------------------------------------------------------------
+    // CREATE — happy path
+    // -------------------------------------------------------------------------
+
+    @Test
+    void createAcceptsAValidLimitOrderAndPublishesCreatedEvent() {
+        UUID orderId = UUID.randomUUID();
+        when(orders.existsById(orderId)).thenReturn(false);
+
+        ProcessingOutcome outcome = handler.handle(createCommand(orderId));
+
+        assertThat(outcome.result().success()).isTrue();
+        assertThat(outcome.result().status()).isEqualTo(201);
+        assertThat(outcome.events()).hasSize(1);
+        assertThat(outcome.events().getFirst().eventType()).isEqualTo("CREATED");
+        verify(asyncDbWriter).enqueue(any(ProcessedCommand.class));
+        // One outbox row for the CREATED event.
+        verify(asyncDbWriter, times(1)).enqueueOutput(any(OrderDomainEvent.class));
+    }
+
+    @Test
+    void createRetriesWhenTheMemoryIndexCannotAnswerDuplicateOrderCheck() {
+        UUID orderId = UUID.randomUUID();
+        OrderStateCache unready = new OrderStateCache(orders, processed, metrics, null, 1000, 1000);
+        OrderCommandHandler unreadyHandler = new OrderCommandHandler(
+                orders, new ObjectMapper(), observations, metrics, unready, asyncDbWriter, dispatcher);
+
+        ProcessingOutcome outcome = unreadyHandler.handle(createCommand(orderId));
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(503);
+        verify(orders, never()).existsById(any());
+        verify(asyncDbWriter, never()).enqueue(any(ProcessedCommand.class));
+    }
+
+    private static RotatingDedupIndex readyDedup() {
+        RotatingDedupIndex dedup = new RotatingDedupIndex(Duration.ofHours(24), 2, 100_000, 0.001);
+        dedup.publishHistory(new CommandDedupIndex(100_000, 0.001));
+        return dedup;
+    }
+
+    @Test
+    void createAcceptsAMarketOrder() {
+        UUID orderId = UUID.randomUUID();
+        when(orders.existsById(orderId)).thenReturn(false);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, orderId, null, listing(),
+                OrderSide.SELL, OrderType.MARKET,
+                new BigDecimal("10"), null, "DMA", "mkt-ref", null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isTrue();
+        assertThat(outcome.result().status()).isEqualTo(201);
+    }
+
+    // -------------------------------------------------------------------------
+    // CREATE — desk derivation: falls back to userSubject when deskId is blank
+    // -------------------------------------------------------------------------
+
+    @Test
+    void createUsesUserSubjectAsDeskWhenDeskIdIsBlank() {
+        UUID orderId = UUID.randomUUID();
+        when(orders.existsById(orderId)).thenReturn(false);
+
+        // deskId omitted — construct a command with deskId=null via a custom command
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, orderId, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "DMA", "ref", null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isTrue();
+        // The order should have been saved; desk = userSubject
+        verify(asyncDbWriter).enqueueNew(any(TradingOrder.class));
+    }
+
+    // -------------------------------------------------------------------------
+    // CREATE — validation failures
+    // -------------------------------------------------------------------------
+
+    @Test
+    void createRejectsCommandWithMissingOrderId() {
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, null, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "DMA", "ref", null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(400);
+        verify(orders, never()).save(any());
+        verify(asyncDbWriter, never()).enqueueOutput(any(OrderDomainEvent.class));
+    }
+
+    @Test
+    void createRejectsCommandWithMissingListing() {
+        UUID orderId = UUID.randomUUID();
+        when(orders.existsById(orderId)).thenReturn(false);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, orderId, null, null,
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "DMA", "ref", null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(400);
+    }
+
+    @Test
+    void createRejectsDuplicateOrderId() {
+        UUID orderId = UUID.randomUUID();
+        TradingOrder existing = liveOrder();
+        ReflectionTestUtils.setField(existing, "id", orderId);
+        cache.put(existing);
+
+        ProcessingOutcome outcome = handler.handle(createCommand(orderId));
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(409);
+    }
+
+    @Test
+    void createRejectsInvalidQuantityNotAlignedWithSizeIncrement() {
+        UUID orderId = UUID.randomUUID();
+        when(orders.existsById(orderId)).thenReturn(false);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, orderId, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10.005"), new BigDecimal("100"), "DMA", "ref", null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(400);
+    }
+
+    @Test
+    void createRejectsOffTickLimitPrice() {
+        UUID orderId = UUID.randomUUID();
+        when(orders.existsById(orderId)).thenReturn(false);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, orderId, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100.005"), "DMA", "ref", null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(400);
+    }
+
+    // -------------------------------------------------------------------------
+    // CREATE — child orders
+    // -------------------------------------------------------------------------
+
+    @Test
+    void createAllowsAChildOrderUnderALiveParent() {
+        TradingOrder parent = liveOrder();
+        UUID childId = UUID.randomUUID();
+        when(orders.existsById(childId)).thenReturn(false);
+        cache.put(parent);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, childId, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "VWAP", "child-ref",
+                parent.getId(), Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isTrue();
+        assertThat(outcome.result().status()).isEqualTo(201);
+    }
+
+    @Test
+    void createRejectsChildOrderWhenParentIsPendingCancellation() {
+        TradingOrder parent = liveOrder();
+        parent.requestCancel();
+        UUID childId = UUID.randomUUID();
+        when(orders.existsById(childId)).thenReturn(false);
+        cache.put(parent);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, childId, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "VWAP", "child-ref",
+                parent.getId(), Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(409);
+    }
+
+    // -------------------------------------------------------------------------
+    // MODIFY
+    // -------------------------------------------------------------------------
+
+    @Test
+    void modifyUpdatesQuantityAndPriceOnADmaOrder() {
+        TradingOrder order = liveOrder();
+        cache.put(order);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.MODIFY,
+                USER, Instant.EPOCH, order.getId(), order.getVersion(), null,
+                null, null, new BigDecimal("20"), new BigDecimal("105"), null, null, null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isTrue();
+        assertThat(outcome.result().status()).isEqualTo(200);
+        assertThat(outcome.events().getFirst().eventType()).isEqualTo("MODIFIED");
+        verify(asyncDbWriter, times(1)).enqueueOutput(any(OrderDomainEvent.class));
+    }
+
+    @Test
+    void modifyRejectsNonDmaOrders() {
+        TradingOrder order = liveOrder("VWAP");
+        cache.put(order);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.MODIFY,
+                USER, Instant.EPOCH, order.getId(), order.getVersion(), null,
+                null, null, new BigDecimal("20"), new BigDecimal("105"), null, null, null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(409);
+    }
+
+    @Test
+    void modifyRejectsStaleExpectedVersion() {
+        TradingOrder order = liveOrder();
+        cache.put(order);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.MODIFY,
+                USER, Instant.EPOCH, order.getId(), order.getVersion() + 99, null,
+                null, null, new BigDecimal("20"), new BigDecimal("105"), null, null, null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(409);
+    }
+
+    @Test
+    void modifyRejectsOrderPendingCancellation() {
+        TradingOrder order = liveOrder();
+        order.requestCancel();
+        cache.put(order);
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.MODIFY,
+                USER, Instant.EPOCH, order.getId(), order.getVersion(), null,
+                null, null, new BigDecimal("20"), new BigDecimal("105"), null, null, null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(409);
+    }
+
+    @Test
+    void modifyRejectsOrderNotFoundOnDesk() {
+        UUID orderId = UUID.randomUUID();
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.MODIFY,
+                USER, Instant.EPOCH, orderId, 0L, null,
+                null, null, new BigDecimal("20"), new BigDecimal("105"), null, null, null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(404);
+    }
+
+    // -------------------------------------------------------------------------
+    // CANCEL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void cancelRequestsParentCancellationAndPublishesCancelRequestedEvent() {
+        TradingOrder order = liveOrder();
+        cache.put(order);
+        when(orders.findByParentOrderIdAndStatusIn(any(), any())).thenReturn(List.of());
+
+        ProcessingOutcome outcome = handler.handle(cancelCommand(order.getId()));
+
+        assertThat(outcome.result().success()).isTrue();
+        assertThat(outcome.result().status()).isEqualTo(200);
+        assertThat(outcome.events()).hasSize(1);
+        assertThat(outcome.events().getFirst().eventType()).isEqualTo("CANCEL_REQUESTED");
+        assertThat(order.getTargetStatus()).isEqualTo(OrderStatus.CANCELLED);
+        verify(asyncDbWriter, times(1)).enqueueOutput(any(OrderDomainEvent.class));
+    }
+
+    @Test
+    void cancelCascadesToLiveChildOrdersRecursively() {
+        TradingOrder parent = liveOrder();
+        TradingOrder child = childOrder(parent);
+
+        cache.put(parent);
+        cache.put(child);
+        // First call: children of parent; second call (recursive): children of child
+        when(orders.findByParentOrderIdAndStatusIn(org.mockito.ArgumentMatchers.eq(parent.getId()), any()))
+                .thenReturn(List.of(child));
+        when(orders.findByParentOrderIdAndStatusIn(org.mockito.ArgumentMatchers.eq(child.getId()), any()))
+                .thenReturn(List.of());
+
+        ProcessingOutcome outcome = handler.handle(cancelCommand(parent.getId()));
+
+        assertThat(outcome.result().success()).isTrue();
+        // parent event + child event
+        assertThat(outcome.events()).hasSize(2);
+        assertThat(child.getTargetStatus()).isEqualTo(OrderStatus.CANCELLED);
+        assertThat(parent.getTargetStatus()).isEqualTo(OrderStatus.CANCELLED);
+    }
+
+    @Test
+    void cancelRejectsAlreadyPendingCancellation() {
+        TradingOrder order = liveOrder();
+        order.requestCancel();
+        cache.put(order);
+
+        ProcessingOutcome outcome = handler.handle(cancelCommand(order.getId()));
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(409);
+    }
+
+    // -------------------------------------------------------------------------
+    // CANCEL_ALL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void cancelAllRequestsCancellationForAllActiveOrdersOnDesk() {
+        TradingOrder first = liveOrder();
+        TradingOrder second = liveOrder();
+        cache.put(first);
+        cache.put(second);
+
+        ProcessingOutcome outcome = handler.handle(cancelAllCommand());
+
+        assertThat(outcome.result().success()).isTrue();
+        assertThat(outcome.result().status()).isEqualTo(200);
+        assertThat(outcome.events()).hasSize(2);
+        assertThat(first.getTargetStatus()).isEqualTo(OrderStatus.CANCELLED);
+        assertThat(second.getTargetStatus()).isEqualTo(OrderStatus.CANCELLED);
+        // Two child CANCEL_REQUESTED events.
+        verify(asyncDbWriter, times(2)).enqueueOutput(any(OrderDomainEvent.class));
+    }
+
+    @Test
+    void cancelAllSkipsOrdersAlreadyPendingCancellation() {
+        TradingOrder alreadyCancelling = liveOrder();
+        alreadyCancelling.requestCancel();
+        cache.put(alreadyCancelling);
+
+        ProcessingOutcome outcome = handler.handle(cancelAllCommand());
+
+        assertThat(outcome.result().success()).isTrue();
+        // No new events for already-cancelling orders
+        assertThat(outcome.events()).isEmpty();
+    }
+
+    @Test
+    void cancelAllWithNoActiveOrdersReturnsSuccessWithZeroEvents() {
+        when(orders.findByDeskIdAndStatusInOrderByCreatedAtDesc(any(), any()))
+                .thenReturn(List.of());
+
+        ProcessingOutcome outcome = handler.handle(cancelAllCommand());
+
+        assertThat(outcome.result().success()).isTrue();
+        assertThat(outcome.events()).isEmpty();
+    }
+
+    // -------------------------------------------------------------------------
+    // Schema version guard
+    // -------------------------------------------------------------------------
+
+    @Test
+    void rejectsCommandWithUnsupportedSchemaVersion() {
+        UUID orderId = UUID.randomUUID();
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION + 1, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, orderId, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "DMA", "ref", null, Map.of()
+        );
+
+        ProcessingOutcome outcome = handler.handle(command);
+
+        assertThat(outcome.result().success()).isFalse();
+        assertThat(outcome.result().status()).isEqualTo(400);
+    }
+
+    // -------------------------------------------------------------------------
+    // Idempotency: cached ProcessedCommand replay
+    // -------------------------------------------------------------------------
+
+    @Test
+    void returnsTheCachedResultForAReplayedCommandId() {
+        UUID commandId = UUID.randomUUID();
+        OrderCommandResult cachedResult = new OrderCommandResult(
+                SCHEMA_VERSION, commandId, true, 201, null, "{}");
+        ProcessedCommand cached = new ProcessedCommand(cachedResult);
+        cache.putProcessed(cached);
+        when(events.findByCommandIdOrderByOccurredAtAsc(commandId)).thenReturn(List.of());
+
+        OrderCommand command = new OrderCommand(
+                SCHEMA_VERSION, commandId, CommandType.CREATE,
+                USER, Instant.EPOCH, UUID.randomUUID(), null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "DMA", "ref", null, Map.of()
+        );
+
+        ProcessingOutcome first = new ProcessingOutcome(cachedResult, List.of());
+        ProcessingOutcome replayed = handler.handle(command);
+
+        assertThat(replayed.result()).isEqualTo(first.result());
+        verify(orders, never()).existsById(any());
+        verify(asyncDbWriter, never()).enqueueOutput(any(OrderDomainEvent.class));
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private static TradingOrder liveOrder() {
+        return liveOrder("DMA");
+    }
+
+    private static TradingOrder liveOrder(String destination) {
+        UUID id = UUID.randomUUID();
+        TradingOrder order = new TradingOrder(
+                id, USER, DESK, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"),
+                destination, "test-ref", null, id, "{}"
+        );
+        ReflectionTestUtils.setField(order, "version", 1L);
+        return order;
+    }
+
+    private static TradingOrder childOrder(TradingOrder parent) {
+        TradingOrder child = new TradingOrder(
+                UUID.randomUUID(), USER, DESK, listing(), OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "DMA", "child-ref",
+                parent.getId(), parent.getRootOrderId(), "{}"
+        );
+        ReflectionTestUtils.setField(child, "version", 1L);
+        return child;
+    }
+
+    /**
+     * Deduplication with the index answering, which the benchmark could not
+     * cover: it never sends a duplicate, so a run proving the index adds no
+     * duplicates says nothing about whether it catches one.
+     *
+     * <p>The index only ever reports "definitely new" or "possibly seen". The
+     * first answer must not be given for a command already handled, and the
+     * second must fall through to the exact tier so the caller gets the original
+     * result rather than a second order.
+     */
+    @Test
+    void aDuplicateCommandIsStillRefusedWhileTheIndexIsAnswering() {
+        RotatingDedupIndex dedup = new RotatingDedupIndex(Duration.ofHours(24), 2, 1_000, 0.001);
+        OrderStateCache indexed = new OrderStateCache(orders, processed, metrics, dedup, 1000, 1000);
+        dedup.publishHistory(new CommandDedupIndex(1_000, 0.001));
+        OrderCommandHandler indexedHandler = new OrderCommandHandler(
+                orders, new ObjectMapper(), observations, metrics, indexed, asyncDbWriter, dispatcher);
+        assertThat(indexed.isReady()).isTrue();
+
+        OrderCommand command = createCommand(UUID.randomUUID());
+        ProcessingOutcome first = indexedHandler.handle(command);
+        ProcessingOutcome duplicate = indexedHandler.handle(command);
+
+        assertThat(first.result().status()).isEqualTo(201);
+        assertThat(duplicate.result()).isEqualTo(first.result());
+        // One order, not two: the duplicate was answered, not executed.
+        verify(asyncDbWriter, times(1)).enqueueNew(any(TradingOrder.class));
+    }
+
+    /**
+     * A second CREATE reusing an orderId the index has already seen must be
+     * refused rather than silently upserting over the original - the guard that
+     * survived because existsById moved into the index instead of being deleted.
+     */
+    @Test
+    void aReusedOrderIdIsRefusedWhileTheIndexIsAnswering() {
+        RotatingDedupIndex dedup = new RotatingDedupIndex(Duration.ofHours(24), 2, 1_000, 0.001);
+        OrderStateCache indexed = new OrderStateCache(orders, processed, metrics, dedup, 1000, 1000);
+        dedup.publishHistory(new CommandDedupIndex(1_000, 0.001));
+        OrderCommandHandler indexedHandler = new OrderCommandHandler(
+                orders, new ObjectMapper(), observations, metrics, indexed, asyncDbWriter, dispatcher);
+
+        UUID orderId = UUID.randomUUID();
+        indexedHandler.handle(createCommand(orderId));
+        // A different command carrying the same orderId, so commandId dedup
+        // cannot be what catches it.
+        ProcessingOutcome reused = indexedHandler.handle(createCommand(orderId));
+
+        assertThat(reused.result().status()).isEqualTo(409);
+    }
+
+    /**
+     * The optimistic-lock guard the API advertises, which had silently stopped
+     * firing. Order writes moved to raw JDBC in AsyncDbWriter, which bypasses
+     * Hibernate, so nothing incremented entity_version any more: every order sat
+     * at version 0 for its whole life and the check compared 0 against 0.
+     */
+    @Test
+    void aModifyCarryingAVersionOlderThanTheOrderIsRefused() {
+        TradingOrder order = liveOrder();
+        cache.put(order);
+        long asTheClientReadIt = order.getVersion();
+
+        // A fill lands between the client's read and its modify. Every committed
+        // state change goes through cache.put, which is what stamps the revision.
+        order.applyFill(new BigDecimal("1"), new BigDecimal("100"));
+        cache.put(order);
+
+        ProcessingOutcome outcome = handler.handle(modifyCommand(order, asTheClientReadIt));
+
+        assertThat(outcome.result().status()).isEqualTo(409);
+        assertThat(outcome.result().detail()).contains("changed since it was loaded");
+    }
+
+    @Test
+    void aModifyCarryingTheCurrentVersionIsAccepted() {
+        TradingOrder order = liveOrder();
+        cache.put(order);
+
+        order.applyFill(new BigDecimal("1"), new BigDecimal("100"));
+        cache.put(order);
+
+        ProcessingOutcome outcome = handler.handle(modifyCommand(order, order.getVersion()));
+
+        assertThat(outcome.result().status()).isEqualTo(200);
+    }
+
+    /**
+     * Pins the wiring the order-id oracle depends on. Enqueued as an ordinary
+     * write, a CREATE would upsert over any row already carrying that id -
+     * resetting a live order's status and traded quantity while keeping the
+     * original's identity columns, with nothing downstream to notice.
+     */
+    @Test
+    void aCreateIsEnqueuedAsAFirstWriteSoACollisionCanBeSeen() {
+        handler.handle(createCommand(UUID.randomUUID()));
+
+        verify(asyncDbWriter).enqueueNew(any(TradingOrder.class));
+        verify(asyncDbWriter, never()).enqueue(any(TradingOrder.class));
+    }
+
+    private static OrderCommand modifyCommand(TradingOrder order, long expectedVersion) {
+        return new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.MODIFY,
+                USER, Instant.EPOCH, order.getId(), expectedVersion, null,
+                null, null, new BigDecimal("20"), new BigDecimal("105"), null, null, null, Map.of()
+        );
+    }
+
+    private static OrderCommand createCommand(UUID orderId) {
+        return new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CREATE,
+                USER, Instant.EPOCH, orderId, null, listing(),
+                OrderSide.BUY, OrderType.LIMIT,
+                new BigDecimal("10"), new BigDecimal("100"), "DMA", "ref", null, Map.of()
+        );
+    }
+
+    private static OrderCommand cancelCommand(UUID orderId) {
+        return new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CANCEL,
+                USER, Instant.EPOCH, orderId, null, null,
+                null, null, null, null, null, null, null, Map.of()
+        );
+    }
+
+    private static OrderCommand cancelAllCommand() {
+        return new OrderCommand(
+                SCHEMA_VERSION, UUID.randomUUID(), CommandType.CANCEL_ALL,
+                USER, Instant.EPOCH, null, null, null,
+                null, null, null, null, null, null, null, Map.of()
+        );
+    }
+
+    private static ListingSnapshot listing() {
+        return new ListingSnapshot(
+                1, 1, "AAPL", "Apple Inc.", "AAPL", "XNAS", "Nasdaq",
+                "US", "USD",
+                new BigDecimal("0.01"), new BigDecimal("0.01"),
+                new BigDecimal("200"), new BigDecimal("198")
+        );
+    }
+}

@@ -1,0 +1,318 @@
+server:
+  port: ${SERVER_PORT:8086}
+  shutdown: graceful
+spring:
+  application.name: order-management-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/emporia}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:admin123}
+    hikari:
+      pool-name: ${DB_POOL_NAME:order-management-pool}
+      schema: ${DB_SCHEMA:emporia_order_data}
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:20}
+      minimum-idle: ${DB_POOL_MIN_IDLE:10}
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT_MS:2000}
+      validation-timeout: ${DB_POOL_VALIDATION_TIMEOUT_MS:1000}
+      idle-timeout: ${DB_POOL_IDLE_TIMEOUT_MS:300000}
+      max-lifetime: ${DB_POOL_MAX_LIFETIME_MS:1800000}
+      keepalive-time: ${DB_POOL_KEEPALIVE_TIME_MS:120000}
+      leak-detection-threshold: ${DB_POOL_LEAK_DETECTION_THRESHOLD_MS:5000}
+  flyway:
+    default-schema: ${DB_SCHEMA:emporia_order_data}
+    schemas: ${DB_SCHEMA:emporia_order_data}
+    locations: classpath:db/migration/order_data
+    create-schemas: true
+  jpa:
+    open-in-view: false
+    hibernate.ddl-auto: validate
+    properties:
+      hibernate.default_schema: ${DB_SCHEMA:emporia_order_data}
+      hibernate.jdbc.time_zone: UTC
+  security.oauth2.resourceserver.jwt:
+    issuer-uri: ${EMPORIA_AUTH_ISSUER:http://localhost:3001}
+    jwk-set-uri: ${EMPORIA_AUTH_JWK_SET_URI:http://localhost:9000/oauth2/jwks}
+emporia.static-data.url: ${EMPORIA_STATIC_DATA_URL:http://localhost:8081}
+emporia.disruptor:
+  # busyspin | yielding | sleeping | blocking. Same reasoning as the
+  # exchange-core wait-strategy below: the writer thread does not have a core to
+  # itself since the OMS/execution merge, and a spinning strategy holds one
+  # (oms-hotpath-1 measured at ~89% of a core while idle) that the dispatcher
+  # shards and exchange-core threads are also competing for. See CONFIGURATION.md.
+  wait-strategy: ${EMPORIA_DISRUPTOR_WAIT_STRATEGY:blocking}
+  min-remaining-capacity: ${EMPORIA_DISRUPTOR_MIN_REMAINING_CAPACITY:1024}
+  # Diagnostic, off at 0: above this ring queue wait, one line records whether
+  # the writer thread was busy or simply not running. Off by default because it
+  # only earns its place while chasing a tail.
+  stall-threshold-ms: ${EMPORIA_DISRUPTOR_STALL_THRESHOLD_MS:0}
+  warmup-iterations: ${EMPORIA_DISRUPTOR_WARMUP_ITERATIONS:2048}
+  cpu-set: ${EMPORIA_DISRUPTOR_CPU_SET:}
+  numa-node: ${EMPORIA_DISRUPTOR_NUMA_NODE:}
+
+# Answers "has this command been seen" from memory instead of Postgres. The two
+# lookups it replaces cost 2.312 of the handler's 2.405 ms/order on the single
+# writer thread, with zero cache hits across 14,402 orders - a CREATE carries
+# freshly generated ids, so the read-through fallback fires every time.
+#
+# On by default as of the A/B below. Six alternating runs at 120 orders/sec,
+# both orders of arm, ring queue wait 0.035-0.230 ms with it against
+# 1.872-5.712 ms without - no overlap, and max wait 17-52 ms against 248-479 ms.
+# Deduplication is unchanged in behaviour: a duplicate command is still refused
+# and a reused orderId still returns 409, covered by tests rather than by the
+# benchmark, which never sends a duplicate.
+#
+# No longer switchable. The enabled flag was kept while this was new, because
+# deduplication failing means a duplicate position and a property beats a
+# redeploy - and it is gone because the evidence it waited for arrived: two
+# hours at 10 orders/sec with one request in ten replaying an earlier
+# Idempotency-Key, roughly 7,160 real duplicates, none reaching the database,
+# on top of the horizon and crash behaviour being demonstrated rather than
+# argued. See CONFIGURATION.md.
+#
+# Watch emporia.oms.dedup.duplicate_reached_db and duplicate_order_reached_db.
+# Both are database-side, so they report a failure of this index from the far
+# side of it, and both must stay at zero.
+emporia.dedup-index:
+  # When the filters rotate: the START of each trading session.
+  #
+  # Two sessions here - 06:00-12:00 and 12:30-18:00 - so the starts are 06:00 and
+  # 12:30. Only the starts are configured, because session ends do not affect
+  # rotation; holding them here would be configuration nothing reads and nothing
+  # would detect as wrong. These are expected to be adjusted per country at
+  # deployment, and any number of sessions works.
+  #
+  # THE RULE WHEN CHANGING THESE: retain as many generations as there are
+  # session starts. The gaps between consecutive starts always sum to exactly one
+  # day however unevenly the day is carved up, so that rule yields exactly 24
+  # hours of horizon for any country, with no arithmetic needed here. Retaining
+  # fewer does not - 06:00 and 12:30 leave gaps of 6h30 and 17h30, so retaining
+  # one covers 6h30 at its worst. The service refuses to start if the horizon
+  # lands under the Idempotency-Key TTL, so a mistake here fails deployment
+  # rather than producing duplicate positions months later.
+  #
+  # Quoted because YAML 1.1 reads an unquoted 12:30 as the sexagesimal integer
+  # 750.
+  session-starts: "${EMPORIA_DEDUP_INDEX_SESSION_STARTS:06:00,12:30}"
+  zone: ${EMPORIA_DEDUP_INDEX_ZONE:UTC}
+  # Sessions retained behind the live filter. This is what turns the schedule
+  # above into the horizon, and it is a correctness parameter, not a performance
+  # one.
+  #
+  # Past the horizon the filters report "never seen" and OrderStateCache returns
+  # that answer WITHOUT consulting Postgres, so a command older than it reads as
+  # new even though the database still holds it. Coverage is at its minimum in
+  # the instant after a rotation, where it is exactly the sum of the retained
+  # gaps - here 6h30 + 17h30 = 24 hours, matching the Idempotency-Key TTL the
+  # processed-command cache already promises callers.
+  #
+  # The order-id key space carries a guard on top of this that does not expire,
+  # because strategy parents derive child ids deterministically and can outlive
+  # any window: DedupIndexLoader loads every working order regardless of age.
+  sessions-retained: ${EMPORIA_DEDUP_INDEX_SESSIONS_RETAINED:2}
+  # Rotate at a fixed spacing instead, ignoring the two resets above. Test-only:
+  # scripts/perf/dedup-horizon-check.sh sets it to compress the horizon to
+  # minutes, because demonstrating the whole of it against the daily schedule
+  # takes a day and a half. Leaving it set in production would reintroduce the
+  # restart-relative window the fixed times replaced.
+  rotate-interval: ${EMPORIA_DEDUP_INDEX_ROTATE_INTERVAL:}
+  # Identifiers expected across the whole horizon, both key spaces counted:
+  # commandId for idempotency, orderId for the duplicate guard. 20M is 24 hours
+  # at the 120 orders/sec this was benchmarked at, at roughly two identifiers per
+  # order.
+  #
+  # ~1.8 bytes per entry at 0.001. Each generation is sized for
+  # expected-entries/sessions-retained - 10M, one session's worth - and steady
+  # state holds (sessions-retained + 1) of those, about 54 MB here, plus the
+  # startup history filter for the first horizon, released once the retained
+  # generations cover the horizon alone.
+  #
+  # Rotation must bound memory on a venue that runs 24/7 and never restarts:
+  # a Bloom filter cannot delete, so a single one fills until every answer is a
+  # false positive - ~0.1% at eight hours, ~15% at three days, ~50% at a week.
+  # Nothing breaks, the hot path just drifts back to Postgres, and no short
+  # benchmark can see it happen.
+  #
+  # Under-sizing is safe and costs latency, not correctness: it raises the
+  # false-positive rate, and a false positive is one Postgres lookup that then
+  # gives the right answer.
+  expected-entries: ${EMPORIA_DEDUP_INDEX_EXPECTED_ENTRIES:20000000}
+  # Only ever wrong in the safe direction. The filter itself cannot produce a
+  # false negative; those can only come from an identifier never being inserted,
+  # or from one aging past the horizon above.
+  false-positive-rate: ${EMPORIA_DEDUP_INDEX_FALSE_POSITIVE_RATE:0.001}
+
+emporia.aeron.intake:
+  enabled: ${EMPORIA_AERON_INTAKE_ENABLED:false}
+  channel: ${EMPORIA_AERON_INTAKE_CHANNEL:aeron:ipc}
+  stream-id: ${EMPORIA_AERON_INTAKE_STREAM_ID:1002}
+  driver-dir: ${EMPORIA_AERON_INTAKE_DRIVER_DIR:}
+  fragment-limit: ${EMPORIA_AERON_INTAKE_FRAGMENT_LIMIT:10}
+
+emporia.wal:
+  # Covers the window between the ring accepting a command and AsyncDbWriter
+  # persisting it - milliseconds - and is rewound after every flush rather than
+  # rotated, so it needs no more room than that window can hold. Unset the path
+  # to run without it, at the cost of losing anything in flight on a crash.
+  #
+  # Recovers process death, not machine loss: append writes into the page cache
+  # and never fsyncs, so a kill -9 is covered and a power failure is not. See
+  # MemoryMappedWalLogger for why forcing on the append path would cost more than
+  # it buys, and CONFIGURATION.md for the exposure that leaves.
+  #
+  # Outside target/ deliberately: a build must not be able to delete live
+  # runtime state.
+  file-path: ${EMPORIA_WAL_FILE_PATH:.local-run/order-management.wal}
+  file-size-mb: ${EMPORIA_WAL_FILE_SIZE_MB:64}
+
+# ── Execution venue (merged from execution-service) ──────────────────────────
+emporia.services:
+  static-data-url: ${EMPORIA_STATIC_DATA_URL:http://localhost:8081}
+  market-data-url: ${EMPORIA_MARKET_DATA_URL:http://localhost:8084}
+  # Self-reference: the execution consumer calls back into this service for
+  # strategy state and recovery views.
+  order-management-url: ${EMPORIA_ORDER_MANAGEMENT_URL:http://localhost:8086}
+emporia.auth:
+  token-url: ${EMPORIA_AUTH_TOKEN_URL:http://localhost:9000/oauth2/token}
+  client-id: ${EXECUTION_OAUTH_CLIENT_ID:emporia-execution}
+  client-secret: ${EXECUTION_OAUTH_CLIENT_SECRET:emporia-execution-local-secret}
+# Whether the operating entity may match client orders inside Emporia, as
+# opposed to routing them to an external venue.
+#
+# This is a statement about the legal entity, not a tuning parameter. Matching
+# client orders internally is unavailable in some jurisdictions - listed
+# securities in Vietnam must trade through the Exchange - and doing it anyway is
+# not a bug that degrades service, it is trading the firm cannot lawfully do,
+# already done by the time anyone notices. So a deployment that configures
+# venue-mode: exchange-core without permission REFUSES TO START.
+#
+# jurisdiction supplies only the DEFAULT for internalisation-permitted, so the
+# safe answer is what you get without thinking about it. The code does not claim
+# to know the law: rules change, and a stale claim in source blocks something
+# lawful as silently as a missing one permits something unlawful. An entity that
+# is licensed to internalise declares it explicitly, in configuration an auditor
+# can read.
+#
+# Leaving jurisdiction unset leaves the guard INACTIVE. That preserves every
+# deployment and development machine that predates it, and it buys no protection
+# at all - see CONFIGURATION.md.
+# Which listings Emporia is willing to quote a two-sided price on.
+#
+# The universe is where market-making risk is CHOSEN, so the three strategies
+# foreseen are three risk postures rather than three implementations:
+#
+#   manual            - a configured list. The only one implemented, and the one
+#                       to start from regardless: nobody runs market making for
+#                       the first time off a generated list.
+#   client-portfolio  - quote what clients actually trade. Safe for retail flow,
+#                       which is uninformed - that is why wholesalers pay for it
+#                       - and dangerous for institutional flow, which is not.
+#   liquidity         - quote where the reference market is deep and tight.
+#                       Needs a statistics accumulator that does not exist yet.
+#
+# This is a SLOW decision, re-evaluated per session and never per order. Quote
+# prices move in milliseconds; which instruments are quoted moves in days.
+#
+# Empty is a valid state and the default: quoting nothing is correct before
+# anyone has decided what to quote, and right for a deployment that only routes.
+# A malformed id refuses startup rather than silently shrinking the universe,
+# because Emporia would then stop quoting an instrument it was told to quote and
+# nothing would report it.
+emporia.quoting:
+  universe: ${EMPORIA_QUOTING_UNIVERSE:manual}
+  listings: ${EMPORIA_QUOTING_LISTINGS:}
+  # Layered over whichever strategy is active, including the generated ones that
+  # do not exist yet. It exists because the reasons to stop quoting one
+  # instrument - a suspension, news pending, a position that just lost money -
+  # arrive faster than any re-evaluation cycle and must take effect now.
+  excluded-listings: ${EMPORIA_QUOTING_EXCLUDED_LISTINGS:}
+
+emporia.compliance:
+  jurisdiction: ${EMPORIA_COMPLIANCE_JURISDICTION:unspecified}
+  internalisation-permitted: ${EMPORIA_COMPLIANCE_INTERNALISATION_PERMITTED:}
+
+emporia.execution:
+  datasource:
+    url: ${EXECUTION_DB_URL:${DB_URL:jdbc:postgresql://localhost:5432/emporia}}
+    username: ${EXECUTION_DB_USERNAME:${DB_USERNAME:postgres}}
+    password: ${EXECUTION_DB_PASSWORD:${DB_PASSWORD:admin123}}
+    hikari:
+      pool-name: ${EXECUTION_DB_POOL_NAME:execution-pool}
+      schema: ${EXECUTION_DB_SCHEMA:emporia_execution}
+      maximum-pool-size: ${EXECUTION_DB_POOL_MAX_SIZE:10}
+      minimum-idle: ${EXECUTION_DB_POOL_MIN_IDLE:2}
+      connection-timeout: ${EXECUTION_DB_POOL_CONNECTION_TIMEOUT_MS:2000}
+      validation-timeout: ${EXECUTION_DB_POOL_VALIDATION_TIMEOUT_MS:1000}
+      idle-timeout: ${EXECUTION_DB_POOL_IDLE_TIMEOUT_MS:300000}
+      max-lifetime: ${EXECUTION_DB_POOL_MAX_LIFETIME_MS:1800000}
+      keepalive-time: ${EXECUTION_DB_POOL_KEEPALIVE_TIME_MS:120000}
+      leak-detection-threshold: ${EXECUTION_DB_POOL_LEAK_DETECTION_THRESHOLD_MS:5000}
+  # Which execution venue this deployment uses. There is no development stand-in
+  # any more: the simulated gateway was deleted because a fake venue that fills
+  # deterministically is a poor rehearsal for either real path, and every
+  # benchmark and check script already set exchange-core.
+  #
+  # This is a declaration of what the operating entity does, not a tuning knob,
+  # and emporia.compliance above can refuse startup on it.
+  venue-mode: ${EXECUTION_VENUE_MODE:exchange-core}
+  fix-venues: ${FIX_EXECUTION_VENUES:}
+  fix-tls-enabled: ${FIX_TLS_ENABLED:false}
+  fix-tls-truststore-path: ${FIX_TLS_TRUSTSTORE_PATH:}
+  fix-tls-truststore-password: ${FIX_TLS_TRUSTSTORE_PASSWORD:}
+  fix-tls-keystore-path: ${FIX_TLS_KEYSTORE_PATH:}
+  fix-tls-keystore-password: ${FIX_TLS_KEYSTORE_PASSWORD:}
+  fill-delay: ${EXECUTION_FILL_DELAY:100ms}
+  strategy-time-compression: ${STRATEGY_TIME_COMPRESSION:60}
+  vwap-default-buckets: ${VWAP_DEFAULT_BUCKETS:10}
+  sor:
+    # A routed child sweeps within this budget and cancels its remainder
+    # rather than resting on the book.
+    slippage-bps: ${EMPORIA_SOR_SLIPPAGE_BPS:10}
+    # Consecutive failed sweeps before the strategy gives up and resolves the
+    # parent order, instead of retrying at tick rate forever.
+    max-retries: ${EMPORIA_SOR_MAX_RETRIES:3}
+  exchange-core:
+    exchange-id: ${EXCHANGE_CORE_EXCHANGE_ID:emporia-simulation}
+    # Deliberately outside target/. This is live venue state and target/ belongs
+    # to the build; any mvn clean while the service was running deleted the
+    # directory beneath it, after which every checkpoint failed silently.
+    storage-directory: ${EXCHANGE_CORE_STORAGE_DIRECTORY:.local-run/exchange-core-simulation}
+    symbol-partitions: ${EXCHANGE_CORE_SYMBOL_PARTITIONS:2}
+    # busy-spin | yielding | blocking. The spinning strategies were sized for
+    # execution having a process to itself; since the OMS/execution merge they
+    # contend with OMS's own Disruptor writer thread and the dispatcher's shard
+    # threads for the same cores. Measured on an 8-core box: yielding leaves 7
+    # threads burning ~68% of a core each (~490% total) with the process idle,
+    # blocking leaves ~73% total. That spin does not slow the work itself, but
+    # it delays when the writer thread gets scheduled, which only shows up once
+    # there is real queueing - at 120 orders/sec, ring queue wait p99 was 201ms
+    # under yielding vs 112ms under blocking (submit p99 224ms vs 134ms). Below
+    # ~100/s the two are indistinguishable against run-to-run noise.
+    # See CONFIGURATION.md.
+    wait-strategy: ${EXCHANGE_CORE_WAIT_STRATEGY:blocking}
+    # Set to full-equity-risk to enable balance tracking and portfolio snapshots.
+    accounting-mode: ${EXCHANGE_CORE_ACCOUNTING_MODE:matching-only}
+    portfolio-url: ${EXCHANGE_CORE_PORTFOLIO_URL:}
+    portfolio-request-timeout: ${EXCHANGE_CORE_PORTFOLIO_REQUEST_TIMEOUT:3s}
+    journaling: ${EXCHANGE_CORE_JOURNALING:true}
+    snapshot-interval: ${EXCHANGE_CORE_SNAPSHOT_INTERVAL:60s}
+    retained-checkpoints: ${EXCHANGE_CORE_RETAINED_CHECKPOINTS:2}
+    min-free-storage-bytes: ${EXCHANGE_CORE_MIN_FREE_STORAGE_BYTES:0}
+# ─────────────────────────────────────────────────────────────────────────────
+management:
+  endpoints.web.exposure.include: health,info,prometheus,reconciliation
+  endpoint.health.probes.enabled: true
+  tracing.sampling.probability: ${OTEL_TRACE_SAMPLE_RATE:1.0}
+  # NOT management.otlp.tracing.endpoint: that name is deprecated at level=error
+  # in Boot 4, meaning it is no longer bound and is silently ignored.
+  opentelemetry.tracing.export.otlp.endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+  # Traces go over OTLP; metrics stay on Prometheus per Phase 1_1. The
+  # starter enables OTLP metrics export by default, which also drags in a
+  # protobuf 4.x runtime that conflicts with the gRPC protobuf pin.
+  otlp.metrics.export.enabled: false
+  metrics.distribution:
+    percentiles-histogram:
+      emporia: true
+      http: true
+      jdbc: true
+    minimum-expected-value.emporia: 1ms
+    maximum-expected-value.emporia: 10s
